@@ -220,7 +220,8 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     // Current password is required unless the user is on a first-login temporary password
     if (!user.isTemporaryPassword || currentPassword) {
       if (!(await verifyPassword(String(currentPassword || ''), user.passwordHash))) {
-        return c.json({ error: 'მიმდინარე პაროლი არასწორია / Current password is incorrect' }, 401);
+        // 400, not 401: the frontend treats any 401 as an expired session and logs the user out
+        return c.json({ error: 'მიმდინარე პაროლი არასწორია / Current password is incorrect' }, 400);
       }
     }
     const updated = (await store.setPassword(user.email, String(newPassword), false))!;
