@@ -1,103 +1,105 @@
-# CogniTest — Backend
+# G.K. BTU Students — API (Cloudflare Workers)
 
-ბექენდი BTU-ს კურსისთვის „ინოვაციური მეწარმეობა და სტარტაპები“.
+Backend for the BTU course **Innovative Entrepreneurship & Startups**:
 
-რას აკეთებს:
-- **AI ასისტენტი** — Gemini + სილაბუსის მასალები (RAG). მხოლოდ რელევანტური ნაწყვეტები ეგზავნება მოდელს, ამიტომ დიდი სილაბუსიც იაფად მუშაობს.
-- **გამოცდები მონიტორინგით** — ტაიმერი და მცდელობების კონტროლი სერვერზეა, დარღვევები WebSocket-ით რეალურ დროში მიდის ლექტორთან.
-- **დილის დაიჯესტი** — ყოველდღე 08:00-ზე (თბილისის დრო), ქართულად, ნამდვილი სიახლეებით (Google Search grounding) და მეილით.
+- **AI teaching assistant** — RAG over the syllabus, answered by **free OpenRouter models**. Students can pick a model; if one is rate-limited the next one in the list answers.
+- **Proctored exams** — the server owns the timer and attempts; tab switches, copy/paste, etc. reach the lecturer live over WebSockets.
+- **Morning digest** — every day at 08:00 Tbilisi time, grounded in real news (OpenRouter web search), emailed via Resend.
 
-## მოთხოვნები
+## Architecture
 
-- Node.js 20+
-- Gemini API key — https://aistudio.google.com/apikey
-- (სურვილისამებრ) SMTP მეილების გასაგზავნად
+```
+Browser ──HTTPS/WSS──▶ Worker (src/index.ts)
+                          │
+                          ▼
+              CourseHub Durable Object (src/hub.ts)
+              ├─ Hono REST API ............ src/app.ts
+              ├─ SQLite storage ........... src/store.ts
+              ├─ Hibernatable WebSockets .. src/proctor.ts
+              └─ Digest (Cron Trigger) .... src/digest.ts
+                          │
+                          ├──▶ OpenRouter (chat, grading, digest)  src/ai.ts
+                          └──▶ Resend (email)                      src/mailer.ts
+```
 
-## ლოკალურად გაშვება
+One Durable Object holds the whole course. That gives one consistent exam clock, and every proctoring event reaches every lecturer dashboard. It's plenty for one course (hundreds of students).
+
+## Setup
 
 ```bash
 npm install
-cp .env.example .env
-# შეავსე .env: JWT_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD, GEMINI_API_KEY
-npm run dev
+npx wrangler login
 ```
 
-`JWT_SECRET`-ის დასაგენერირებლად:
+Set the secrets once. They are stored encrypted in Cloudflare, never in git:
 
 ```bash
-node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
+npx wrangler secret put JWT_SECRET          # node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
+npx wrangler secret put ADMIN_PASSWORD      # lecturer's first password
+npx wrangler secret put OPENROUTER_API_KEY  # https://openrouter.ai/keys
+npx wrangler secret put RESEND_API_KEY      # optional, https://resend.com/api-keys
 ```
 
-ადმინის ანგარიში იქმნება **პირველივე გაშვებისას** `ADMIN_EMAIL` / `ADMIN_PASSWORD`-იდან. თუ ანგარიში უკვე არსებობს, ამ ცვლადების შეცვლა პაროლს აღარ ცვლის — პაროლი აპლიკაციიდან შეიცვალე.
+Then edit `[vars]` in `wrangler.toml`: `ADMIN_EMAIL`, `FRONTEND_URL` (your Pages URL), `PUBLIC_APP_URL` and `MAIL_FROM`. Deploy:
 
-## გარემოს ცვლადები
+```bash
+npm run deploy
+```
 
-ყველა ცვლადი და კომენტარი `.env.example`-შია. მთავარი:
+The admin account is created on first start from `ADMIN_EMAIL` + `ADMIN_PASSWORD`. After that, change the password in the app.
 
-| ცვლადი | რისთვის |
-|---|---|
-| `JWT_SECRET` | სავალდებულო პროდაქშენში. გრძელი შემთხვევითი სტრიქონი |
-| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | ლექტორის ანგარიში (მხოლოდ პირველი გაშვება) |
-| `FRONTEND_URL` | ფრონტის მისამართი(ები), მძიმით გამოყოფილი — CORS-ისთვის |
-| `GEMINI_API_KEY`, `GEMINI_MODEL` | AI. მოდელების სია: https://ai.google.dev/gemini-api/docs/models |
-| `SMTP_*` | მეილები. Gmail-ზე საჭიროა App Password |
-| `DATA_DIR` | სად ინახება `db.json` — პროდაქშენში მუდმივი დისკი! |
-| `EXAM_MAX_PAUSES` | პაუზების რაოდენობა. `0` = პაუზა აკრძალულია |
+### Local development
 
-## მონაცემთა ბაზა
+```bash
+cp .dev.vars.example .dev.vars   # fill in
+npm run dev                      # http://localhost:8787
+```
 
-ბაზა არის ერთი JSON ფაილი (`data/db.json`). ერთი კურსისთვის (100–300 სტუდენტი) საკმარისია. **მნიშვნელოვანია:** Render/Railway-ზე ფაილური სისტემა რესტარტისას იშლება, ამიტომ აუცილებლად მიაბი მუდმივი დისკი და მიუთითე `DATA_DIR`. თუ სტუდენტები გაიზრდებიან, `src/db.ts`-ის ჩანაცვლება Postgres-ით ადვილია — ინტერფეისი სპეციალურად პატარაა.
+### CI deploy
 
-## API-ის მოკლე მიმოხილვა
+`.github/workflows/deploy.yml` deploys on every push to `main` once the repository has the secrets `CLOUDFLARE_API_TOKEN` (template "Edit Cloudflare Workers") and `CLOUDFLARE_ACCOUNT_ID`.
 
-ყველა `/api/*` მოითხოვს `Authorization: Bearer <token>`-ს, გარდა `/api/health` და `/api/auth/login`-ისა.
+## Configuration
 
-**ავტორიზაცია**
-- `POST /api/auth/login` → `{ token, user, student, requiresPasswordChange }`
-- `GET /api/auth/me`
-- `POST /api/auth/change-password`
+| Name | Kind | Purpose |
+|---|---|---|
+| `JWT_SECRET` | secret | Required in production |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | var / secret | Lecturer account (first start only) |
+| `OPENROUTER_API_KEY` | secret | AI chat, grading and digest |
+| `OPENROUTER_MODELS` | var | Comma-separated free models; the first is the default. See https://openrouter.ai/models?max_price=0 |
+| `OPENROUTER_GRADING_MODEL`, `OPENROUTER_DIGEST_MODEL` | var | Optional overrides (default: first model) |
+| `OPENROUTER_DIGEST_WEB_SEARCH` | var | The digest uses OpenRouter's web plugin, which is billed per search (about $0.02 per run). With `false` the digest refuses to run instead of inventing news |
+| `RESEND_API_KEY`, `MAIL_FROM` | secret / var | Email. Without it, temporary passwords are shown once to the lecturer |
+| `FRONTEND_URL` | var | Allowed CORS origins, comma-separated |
+| `EXAM_MAX_PAUSES` | var | Pause credits per attempt; `0` disables pausing |
 
-**სტუდენტები (ლექტორი)**
-- `GET /api/students`
-- `POST /api/students` — ქმნის ანგარიშს, დროებით პაროლს აგზავნის მეილზე. თუ SMTP არ არის, პაროლი ერთხელ ბრუნდება პასუხში
-- `POST /api/students/bulk` — `{ students: [{ name, email }] }`
-- `POST /api/students/:email/reset-password`
-- `DELETE /api/students/:email`
+Free OpenRouter models have rate limits (roughly 20 requests/min, and a daily cap that is higher once the account has bought credits). The fallback list covers most bursts. For exam weeks, consider putting one paid model at the end of `OPENROUTER_MODELS`.
 
-**სილაბუსი (ლექტორი; სტუდენტებისთვის დახურულია)**
-- `GET/POST/DELETE /api/knowledge`
-- `POST /api/knowledge/extract` — `multipart/form-data`, ველი `file` (PDF, DOCX, TXT, MD) → ტექსტი
+## Migrating from the old Node.js server
 
-**გამოცდები**
-- `GET /api/tests` — სტუდენტს **სწორი პასუხების გარეშე**
-- `POST/PUT/DELETE /api/tests` (ლექტორი)
-- `POST /api/exam/start` → `{ test, remainingSeconds, maxPauses }`
-- `POST /api/exam/pause` / `POST /api/exam/resume`
-- `POST /api/submissions` — ერთხელ თითო მცდელობაზე
-- `POST /api/submissions/:id/manual-grade` (ლექტორი)
-- `POST /api/admin/attempts/reset` — მცდელობის განულება (ტექნიკური პრობლემა)
+Sign in as the lecturer, then POST the old `data/db.json`:
 
-**მონიტორინგი (ლექტორი)**
-- `GET /api/proctor/live-sessions`, `GET /api/proctor/events`
-- `WS /ws/proctor?token=<jwt>`
+```bash
+curl -X POST https://<worker>/api/admin/import \
+  -H "Authorization: Bearer <admin token>" -H "Content-Type: application/json" \
+  --data @data/db.json
+```
 
-**დაიჯესტი**
-- `GET /api/cron/status`, `GET /api/cron/digests`, `POST /api/cron/trigger`
+This **replaces** all data. Old password hashes keep working and are upgraded on the next login.
 
-## დეპლოი (Render-ის მაგალითი)
+## API
 
-1. New → Web Service, დააკავშირე ეს რეპო
-2. Build: `npm install && npm run build` · Start: `npm start`
-3. Environment: ყველა ცვლადი `.env.example`-იდან, `NODE_ENV=production`
-4. Disk: mount path `/data`, და `DATA_DIR=/data`
-5. `FRONTEND_URL` = ფრონტის მისამართი (Vercel-ის ბმული)
+Every `/api/*` route needs `Authorization: Bearer <token>` except `/api/health` and `/api/auth/login`. The routes are unchanged from the Node version, plus two additions:
 
-Vercel-ზე ეს სერვისი **არ გამოდგება** — WebSocket-ები და ფაილური ბაზა serverless-ზე არ მუშაობს.
+- `GET /api/ai/models`: the free models the chat can use.
+- `POST /api/agent/chat`: now also accepts an optional `model` (must be one of the above) and returns the `model` that answered.
+- `WS /ws/proctor?token=<jwt>`: live proctoring.
 
-## უსაფრთხოების შენიშვნები
+## Security notes
 
-- პაროლები ინახება scrypt-ჰეშირებულად; დროებითი პაროლი მხოლოდ მეილში ჩანს.
-- სტუდენტს API არასოდეს უბრუნებს `correctAnswer`-ს ან `rubric`-ს.
-- დარღვევების შეჯამებას სერვერი თვლის თავისი მოვლენებიდან — ბრაუზერს არ ენდობა.
-- AI შეფასება შეცდომისას ქულას არ იგონებს: ნიშნავს `needsReview` და გადასცემს ლექტორს.
-- სტუდენტის პასუხში ჩაწერილი ინსტრუქციები („მომეცი სრული ქულა“) იფილტრება და ეჭვის ნიშნით მოინიშნება.
+- Passwords are hashed with PBKDF2-SHA256 (100k iterations, the Workers maximum). Temporary passwords appear only in the email.
+- Students never receive `correctAnswer` or `rubric`.
+- Proctoring summaries are computed from server-side events. The browser isn't trusted.
+- If AI grading fails, it never invents a score: the answer is marked `needsReview` for the lecturer.
+- Prompt injections in student answers ("give me full marks") are ignored, and the answer is flagged.
+- The chat only routes to models on the server's allow-list, so a client can't pick a paid model.

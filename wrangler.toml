@@ -1,0 +1,51 @@
+# G.K. BTU Students — API Worker
+# Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
+name = "gk-btu-students-api"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+# All data + live proctoring sockets live in one SQLite-backed Durable Object
+[[durable_objects.bindings]]
+name = "HUB"
+class_name = "CourseHub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CourseHub"]
+
+# Daily digest: 04:00 UTC = 08:00 in Tbilisi (UTC+4, no daylight saving)
+[triggers]
+crons = ["0 4 * * *"]
+
+[observability]
+enabled = true
+
+[vars]
+ENVIRONMENT = "production"
+# Comma-separated frontend origins allowed by CORS (your Cloudflare Pages URL + custom domain)
+FRONTEND_URL = "https://gk-btu-students.pages.dev"
+PUBLIC_APP_URL = "https://gk-btu-students.pages.dev"
+JWT_EXPIRES_IN = "12h"
+ADMIN_EMAIL = ""
+ADMIN_NAME = "Prof. Giorgi Khatiashvili"
+# Free OpenRouter models, tried in this order (first = default). Students can pick among them in the chat.
+# Current free list: https://openrouter.ai/models?max_price=0
+OPENROUTER_MODELS = "meta-llama/llama-3.3-70b-instruct:free,deepseek/deepseek-chat-v3-0324:free,google/gemma-3-27b-it:free,mistralai/mistral-small-3.2-24b-instruct:free,qwen/qwen3-235b-a22b:free"
+OPENROUTER_GRADING_MODEL = ""
+OPENROUTER_DIGEST_MODEL = ""
+# The digest must be grounded in real news: OpenRouter's web plugin (billed per search, ~$0.02/run)
+OPENROUTER_DIGEST_WEB_SEARCH = "true"
+MAIL_FROM = "G.K. BTU Students <noreply@example.com>"
+DIGEST_ENABLED = "true"
+DIGEST_TIMEZONE = "Asia/Tbilisi"
+EXAM_MAX_PAUSES = "3"
+EXAM_SUBMIT_GRACE_SECONDS = "60"
+
+# Secrets — set once with `npx wrangler secret put <NAME>` (never commit them):
+#   JWT_SECRET          long random string
+#   ADMIN_PASSWORD      lecturer's first password (used only when no admin exists yet)
+#   OPENROUTER_API_KEY  https://openrouter.ai/keys
+#   RESEND_API_KEY      https://resend.com/api-keys (optional; without it passwords are shown once in the UI)
+
+# Local development (`npm run dev`) reads overrides and secrets from .dev.vars

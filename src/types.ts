@@ -81,7 +81,7 @@ export interface QuestionGrading {
   maxPoints: number;
   feedback: string;
   isCorrect?: boolean;
-  autoGradedBy?: 'mcq_rule' | 'gemini_ai' | 'proctor_manual';
+  autoGradedBy?: 'mcq_rule' | 'ai' | 'gemini_ai' | 'proctor_manual';
   /** true when AI grading failed or looked suspicious — lecturer must review */
   needsReview?: boolean;
 }
