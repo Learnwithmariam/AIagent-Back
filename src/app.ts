@@ -6,10 +6,10 @@ import type { Store } from './store';
 import type { ProctorHub } from './proctor';
 import type { Mailer } from './mailer';
 import type { DigestService } from './digest';
-import { availableModels, chatWithTeachingAgent } from './ai';
+import { aiStatus, chatWithTeachingAgent } from './ai';
 import { extractTextFromFile } from './extract';
 import { signToken, verifyToken, verifyPassword, isLegacyHash, publicUser, generateTempPassword, type TokenPayload } from './auth';
-import type { Question, QuestionGrading, Test, TestSubmission, ProctorSummary } from './types';
+import { MAX_TEST_POINTS, type Question, type QuestionGrading, type Test, type TestSubmission, type ProctorSummary } from './types';
 
 export interface Deps {
   store: Store;
@@ -116,6 +116,9 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
           test.questions.map((q) => ({ id: q.id, type: q.type, points: q.points, prompt: '' })),
     };
   }
+
+  /** Points may be fractional (e.g. 2.5 of 10); keep one decimal to avoid float noise. */
+  const roundPts = (n: number) => Math.round(n * 10) / 10;
 
   function isWithinWindow(test: Test) {
     const now = Date.now();
@@ -249,11 +252,12 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   }
 
   app.post('/api/students', requireAdmin, async (c) => {
-    const { name, email, department } = await body(c);
+    const { name, email, department, digestSubscribed } = await body(c);
     if (!name || !email || !/^\S+@\S+\.\S+$/.test(email)) {
       return c.json({ error: 'Valid name and email are required' }, 400);
     }
     const result = await createStudent(String(name), String(email), department);
+    if (result.created && digestSubscribed === false) store.updateStudentSubscription(result.student.email, false);
     // keep backwards compatibility: frontend expects the student object at top level
     return c.json({ ...result.student, _meta: { created: result.created, emailed: result.emailed, temporaryPassword: result.temporaryPassword } });
   });
@@ -278,6 +282,26 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     await store.setPassword(user.email, temp, true);
     const emailed = await mailer.sendWelcome({ to: user.email, name: user.name, temporaryPassword: temp });
     return c.json({ success: true, emailed, temporaryPassword: emailed ? undefined : temp });
+  });
+
+  /** Lecturer edits a student's details. Changing the email also moves their login and records. */
+  app.patch('/api/students/:email', requireAdmin, async (c) => {
+    const b = await body(c);
+    const updates: { name?: string; email?: string; department?: string; digestSubscribed?: boolean } = {};
+    if (b.name !== undefined) {
+      if (!String(b.name).trim()) return c.json({ error: 'Name cannot be empty' }, 400);
+      updates.name = String(b.name).trim().slice(0, 200);
+    }
+    if (b.email !== undefined) {
+      if (!/^\S+@\S+\.\S+$/.test(String(b.email).trim())) return c.json({ error: 'Valid email is required' }, 400);
+      updates.email = String(b.email).trim().toLowerCase();
+    }
+    if (b.department !== undefined) updates.department = String(b.department).trim().slice(0, 200);
+    if (b.digestSubscribed !== undefined) updates.digestSubscribed = Boolean(b.digestSubscribed);
+    const result = store.updateStudent(c.req.param('email'), updates);
+    if (result === 'not_found') return c.json({ error: 'Student not found' }, 404);
+    if (result === 'email_taken') return c.json({ error: 'ეს ელ-ფოსტა უკვე გამოიყენება / This email is already in use' }, 409);
+    return c.json(result);
   });
 
   app.delete('/api/students/:email', requireAdmin, (c) => {
@@ -357,8 +381,9 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
 
   function validateQuestions(questions: unknown): string | null {
     if (!Array.isArray(questions) || questions.length === 0) return 'At least one question is required';
-    const total = questions.reduce((acc: number, q: any) => acc + (Number(q?.points) || 0), 0);
-    if (total > 100) return `Total points cannot exceed 100 (currently ${total}).`;
+    if (questions.some((q: any) => !(Number(q?.points) > 0))) return 'Every question needs a positive number of points';
+    const total = roundPts(questions.reduce((acc: number, q: any) => acc + Number(q.points), 0));
+    if (total > MAX_TEST_POINTS) return `Total points cannot exceed ${MAX_TEST_POINTS} (currently ${total}).`;
     return null;
   }
 
@@ -375,7 +400,7 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
       instructions: String(b.instructions || ''),
       durationMinutes: Number(b.durationMinutes) || 30,
       passingScore: Number(b.passingScore) || 51,
-      totalPoints: questions.reduce((acc, q) => acc + (Number(q.points) || 0), 0),
+      totalPoints: roundPts(questions.reduce((acc, q) => acc + (Number(q.points) || 0), 0)),
       startTime: b.startTime || new Date().toISOString(),
       endTime: b.endTime || new Date(Date.now() + 7 * 86_400_000).toISOString(),
       status: ['draft', 'upcoming', 'active', 'closed'].includes(b.status) ? b.status : 'active',
@@ -558,7 +583,7 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     const grading: Record<string, QuestionGrading> = {};
     for (const q of test.questions) {
       const g = input[q.id] || {};
-      const points = Math.min(q.points, Math.max(0, Number(g.earnedPoints) || 0));
+      const points = roundPts(Math.min(q.points, Math.max(0, Number(g.earnedPoints) || 0)));
       grading[q.id] = {
         questionId: q.id,
         earnedPoints: points,
@@ -568,7 +593,7 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
         autoGradedBy: 'proctor_manual',
       };
     }
-    const totalScore = Object.values(grading).reduce((n, g) => n + g.earnedPoints, 0);
+    const totalScore = roundPts(Object.values(grading).reduce((n, g) => n + g.earnedPoints, 0));
     return c.json(store.updateSubmissionGrading(sub.id, grading, totalScore, test.passingScore));
   };
   app.post('/api/submissions/:id/manual-grade', requireAdmin, applyManualGrade);
@@ -584,17 +609,17 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   });
 
   // -------------------------------------------------------------------------
-  // AI teaching agent (OpenRouter)
+  // AI teaching agent (Gemini, silent fallback to OpenRouter)
   // -------------------------------------------------------------------------
-  app.get('/api/ai/models', requireAuth, (c) => c.json(availableModels(config)));
+  app.get('/api/ai/status', requireAuth, (c) => c.json(aiStatus(config)));
+  app.get('/api/ai/models', requireAuth, (c) => c.json(aiStatus(config))); // old frontends
 
   const chatHandler = async (c: Context<AppEnv>) => {
     const b = await body(c);
     const { message, language } = b || {};
     const history = b?.history || b?.conversationHistory || [];
     if (!message || typeof message !== 'string') return c.json({ error: 'Message is required' }, 400);
-    // Only models from the server's allow-list — the client can't route to arbitrary (paid) models
-    const model = config.openrouter.chatModels.includes(b?.model) ? b.model : undefined;
+    // Routing is server-side only: any `model` sent by the client is ignored
     try {
       const result = await chatWithTeachingAgent(config, {
         message,
@@ -606,7 +631,6 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
         knowledgeDocs: store.getKnowledgeDocs(),
         language: language === 'en' ? 'en' : 'ka',
         studentName: c.get('user').name,
-        model,
       });
       return c.json(result);
     } catch (err: any) {
@@ -625,13 +649,20 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   app.get('/api/cron/digests', requireAuth, (c) => {
     const digests = store.getDigests().slice(0, 60);
     if (c.get('user').role === 'admin') return c.json(digests);
-    return c.json(digests.map(({ recipients, ...d }) => ({ ...d, recipients: [] })));
+    return c.json(digests.map(({ recipients, emailHtml, ...d }) => ({ ...d, recipients: [], emailHtml: '' })));
   });
 
   app.post('/api/cron/trigger', requireAdmin, async (c) => {
     try {
       const { subjectFocus, language } = await body(c);
       const result = await digest.run(subjectFocus || undefined, language === 'en' ? 'en' : 'ka');
+      if (!result) {
+        return c.json({
+          success: true,
+          digest: null,
+          message: 'ახალი ინფორმაცია არ არის — დაიჯესტი არ შეიქმნა / Nothing new since the last digest — nothing was created or sent.',
+        });
+      }
       return c.json({ success: true, digest: result });
     } catch (err: any) {
       return c.json({ error: err.message || 'Failed generating digest' }, 500);

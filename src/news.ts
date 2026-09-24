@@ -79,29 +79,38 @@ async function fetchFeed(url: string): Promise<NewsItem[]> {
   return parseFeed(await res.text(), new URL(url).hostname.replace(/^www\./, ''));
 }
 
+/** Key used to recognise the same story across runs (tracking params and trailing slashes ignored). */
+export const newsKey = (url: string) => url.split(/[?#]/)[0].replace(/\/+$/, '').toLowerCase();
+export const titleKey = (title: string) => title.toLowerCase().replace(/\s+/g, ' ').trim();
+
 /**
- * Recent items from all feeds, newest first, de-duplicated. Takes the last 48 hours;
- * widens to a week if the feeds were quiet. Failing feeds are skipped, not fatal.
+ * NEW items only: published after `since` and never used in an earlier digest (`seenUrls` /
+ * `seenTitles`). Newest first, de-duplicated. There is deliberately no widening of the window
+ * on quiet days — no news means no digest. Failing feeds are skipped, not fatal.
  */
-export async function collectNews(feeds: string[], max = 15): Promise<{ items: NewsItem[]; failedFeeds: string[] }> {
+export async function collectNews(
+  feeds: string[],
+  { since, seenUrls = new Set<string>(), seenTitles = new Set<string>(), max = 15 }: { since: Date; seenUrls?: Set<string>; seenTitles?: Set<string>; max?: number }
+): Promise<{ items: NewsItem[]; failedFeeds: string[] }> {
   const results = await Promise.allSettled(feeds.map(fetchFeed));
   const failedFeeds = feeds.filter((_, i) => results[i].status === 'rejected');
   const all = results.flatMap((r) => (r.status === 'fulfilled' ? r.value : []));
 
   const seen = new Set<string>();
-  const unique = all
+  const recent = all
+    .filter((it) => {
+      const t = Date.parse(it.publishedAt);
+      return t > since.getTime() && t <= Date.now() + 3600_000; // also drop items dated in the future
+    })
     .sort((a, b) => b.publishedAt.localeCompare(a.publishedAt))
     .filter((it) => {
-      const key = it.url.split('?')[0] || it.title.toLowerCase();
-      if (seen.has(key) || seen.has(it.title.toLowerCase())) return false;
-      seen.add(key);
-      seen.add(it.title.toLowerCase());
+      const u = newsKey(it.url);
+      const t = titleKey(it.title);
+      if (seenUrls.has(u) || seenTitles.has(t) || seen.has(u) || seen.has(t)) return false;
+      seen.add(u);
+      seen.add(t);
       return true;
     });
-
-  const within = (hours: number) => unique.filter((it) => Date.now() - Date.parse(it.publishedAt) < hours * 3600_000);
-  let recent = within(48);
-  if (recent.length < 4) recent = within(24 * 7);
 
   // Round-robin across sources so one busy feed doesn't crowd out the rest
   const bySource = new Map<string, NewsItem[]>();

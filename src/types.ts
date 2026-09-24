@@ -1,5 +1,8 @@
 export type Role = 'student' | 'admin';
 
+/** Every quiz/exam is scored out of at most 10 points. */
+export const MAX_TEST_POINTS = 10;
+
 export interface UserAccount {
   id: string;
   email: string;
