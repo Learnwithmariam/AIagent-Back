@@ -58,9 +58,9 @@ cp .dev.vars.example .dev.vars   # fill in
 npm run dev                      # http://localhost:8787
 ```
 
-### CI deploy
+### CI
 
-`.github/workflows/deploy.yml` deploys on every push to `main` once the repository has the secrets `CLOUDFLARE_API_TOKEN` (template "Edit Cloudflare Workers") and `CLOUDFLARE_ACCOUNT_ID`.
+`.github/workflows/ci.yml` only typechecks pushes and pull requests; it never deploys. Deploy with `npm run deploy` (wrangler) to the `aiagent-back` Worker.
 
 ## Configuration
 
