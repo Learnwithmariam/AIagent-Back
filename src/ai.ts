@@ -67,7 +67,9 @@ async function freeModelPool(config: Config): Promise<string[]> {
         Number(m.pricing?.completion) === 0 &&
         !/auto|embed|vision-only|image/i.test(m.id) &&
         (m.context_length || 0) >= 16_000 &&
-        (m.architecture?.output_modalities ? m.architecture.output_modalities.includes('text') : true)
+        // text in, text only out — excludes music/image models that are also free (e.g. Lyria)
+        (m.architecture?.output_modalities ? m.architecture.output_modalities.join() === 'text' : true) &&
+        (m.architecture?.input_modalities ? m.architecture.input_modalities.includes('text') : true)
     );
     const ids = free
       .sort((a, b) => rank(a.id) - rank(b.id) || (b.context_length || 0) - (a.context_length || 0))
