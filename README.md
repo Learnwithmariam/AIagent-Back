@@ -2,7 +2,7 @@
 
 Backend for the BTU course **Innovative Entrepreneurship & Startups**:
 
-- **AI teaching assistant** — a chatbot that answers only questions about Entrepreneurship and Innovations, briefly and in a friendly tone, grounded in the syllabus (RAG). Off-topic questions are politely declined in Georgian. **Google Gemini** answers first; if it fails, **OpenRouter** answers instead. Students never pick or see a model.
+- **AI teaching assistant** — a chatbot that answers only questions about Entrepreneurship and Innovations, briefly and in a friendly tone, grounded in the syllabus (RAG). Off-topic questions are politely declined in Georgian. **Google Gemini** answers first; if it fails, **OpenRouter** answers instead. Students never pick or see a model. Gemini's brief "high demand" errors are retried after a short pause, and the whole chain runs inside a 45-second budget.
 - **Proctored exams, graded by hand** — the server owns the timer and attempts; tab switches, copy/paste, etc. reach the lecturer live over WebSockets. **AI never grades anything**: every submission waits for the lecturer, and students see no score until the lecturer publishes it.
 - **Morning digest** — every day at 08:00 Tbilisi time. News comes from free public **RSS feeds**; Gemini (or a free OpenRouter model as fallback) writes the Georgian summaries. Only news that is new since the last digest and never used before is included. If nothing new or relevant happened, no digest is created or sent.
 - **Quizzes are scored out of 10** — a test's questions can total at most 10 points (half points allowed).
@@ -71,7 +71,8 @@ npm run dev                      # http://localhost:8787
 | `GEMINI_API_KEY` | secret | Primary AI for the chat and digest |
 | `GEMINI_MODELS` | var | Gemini models tried in order (default `gemini-3.6-flash,gemini-3.5-flash`; `gemini-1.5-flash` is retired by Google) |
 | `OPENROUTER_API_KEY` | secret | Fallback AI when Gemini fails |
-| `OPENROUTER_MODELS` | var | Comma-separated fallback models, tried in order. See https://openrouter.ai/models?max_price=0 |
+| `OPENROUTER_MODELS` | var | Comma-separated fallback models, tried in order. Ids no longer in OpenRouter's live catalogue are skipped, and `openrouter/free` is always the last resort. See https://openrouter.ai/models?max_price=0 |
+| `DIGEST_EMAIL` | var | `"false"` keeps the daily 08:00 digest in-app only. Generating a digest from the dashboard never sends email |
 | `OPENROUTER_DIGEST_MODEL` | var | Optional. The digest only ever uses `:free` models, whatever is configured |
 | `DIGEST_FEEDS` | var | Comma-separated RSS/Atom feeds for the digest. Empty = TechCrunch Startups, Crunchbase News, Sifted, EU-Startups, VentureBeat |
 | `RESEND_API_KEY`, `MAIL_FROM` | secret / var | Email. Without it, temporary passwords are shown once to the lecturer |

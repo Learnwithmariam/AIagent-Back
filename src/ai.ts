@@ -111,6 +111,8 @@ async function callOpenRouter(config: Config, model: string, messages: Msg[], op
       messages,
       temperature: opts.temperature ?? 0.5,
       max_tokens: opts.maxTokens ?? 1500,
+      // keep reasoning models' scratchpad out of the reply
+      reasoning: { exclude: true },
     }),
     signal: AbortSignal.timeout(opts.timeoutMs),
   });
@@ -132,28 +134,24 @@ async function callOpenRouter(config: Config, model: string, messages: Msg[], op
 }
 
 // Free OpenRouter models come and go (ids that were free get moved to paid-only and return 404),
-// so the fallback pool comes from OpenRouter's live catalogue, refreshed every few hours.
-let freeCatalog: { ids: string[]; fetchedAt: number } | null = null;
+// so the configured list is checked against OpenRouter's live catalogue, refreshed every few hours.
+// "openrouter/free" (OpenRouter's router across whatever free models are up) is the last resort.
+const FREE_ROUTER = 'openrouter/free';
+let catalog: { ids: Set<string>; fetchedAt: number } | null = null;
 
-async function openRouterPool(config: Config, preferred: string[]): Promise<string[]> {
-  if (!freeCatalog || Date.now() - freeCatalog.fetchedAt > 6 * 3600_000) {
+async function openRouterPool(preferred: string[]): Promise<string[]> {
+  if (!catalog || Date.now() - catalog.fetchedAt > 6 * 3600_000) {
     try {
       const res = await fetch('https://openrouter.ai/api/v1/models', { signal: AbortSignal.timeout(5_000) });
       const data: any = await res.json();
-      const ids = (Array.isArray(data?.data) ? data.data : [])
-        .filter((m: any) => typeof m?.id === 'string' && m.id.endsWith(':free') && Number(m?.context_length) >= 16_000)
-        // newest first: recent free models are the ones still being served
-        .sort((a: any, b: any) => (Number(b.created) || 0) - (Number(a.created) || 0))
-        .map((m: any) => m.id as string);
-      if (ids.length) freeCatalog = { ids, fetchedAt: Date.now() };
+      const ids = new Set<string>((Array.isArray(data?.data) ? data.data : []).map((m: any) => String(m?.id)));
+      if (ids.size) catalog = { ids, fetchedAt: Date.now() };
     } catch (err) {
       console.warn('OpenRouter catalogue unavailable:', String((err as Error)?.message || err));
     }
   }
-  if (!freeCatalog) return preferred;
-  const live = new Set(freeCatalog.ids);
-  // configured models that are still free, then other free models from the catalogue
-  return [...new Set([...preferred.filter((m) => live.has(m)), ...freeCatalog.ids])].slice(0, 6);
+  const live = catalog ? preferred.filter((m) => catalog!.ids.has(m)) : preferred;
+  return [...new Set([...live, FREE_ROUTER])];
 }
 
 /**
@@ -201,7 +199,7 @@ async function complete(config: Config, messages: Msg[], opts: CompletionOpts = 
   }
 
   if (config.openrouter.apiKey && left() > 4_000) {
-    for (const model of await openRouterPool(config, opts.models || config.openrouter.chatModels)) {
+    for (const model of await openRouterPool(opts.models || config.openrouter.chatModels)) {
       if (left() < 4_000) break;
       try {
         return await callOpenRouter(config, model, messages, { ...opts, timeoutMs: Math.min(30_000, left() - 1_000) });

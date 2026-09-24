@@ -40,13 +40,7 @@ export const APP_NAME = 'G.K. BTU Students';
  * The free catalogue changes often — check https://openrouter.ai/models?max_price=0
  * and override the list in wrangler.toml instead of editing code.
  */
-export const DEFAULT_FREE_MODELS = [
-  'meta-llama/llama-3.3-70b-instruct:free',
-  'deepseek/deepseek-chat-v3-0324:free',
-  'google/gemma-3-27b-it:free',
-  'mistralai/mistral-small-3.2-24b-instruct:free',
-  'qwen/qwen3-235b-a22b:free',
-];
+export const DEFAULT_FREE_MODELS = ['google/gemma-4-31b-it:free', 'qwen/qwen3.8-27b:free', 'z-ai/glm-5.2:free'];
 
 /**
  * Gemini models tried in order before falling back to OpenRouter. gemini-1.5-flash has been
