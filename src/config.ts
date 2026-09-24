@@ -10,6 +10,7 @@ export interface Env {
   // secrets
   JWT_SECRET?: string;
   ADMIN_PASSWORD?: string;
+  GEMINI_API_KEY?: string;
   OPENROUTER_API_KEY?: string;
   RESEND_API_KEY?: string;
 
@@ -20,6 +21,7 @@ export interface Env {
   JWT_EXPIRES_IN?: string;
   ADMIN_EMAIL?: string;
   ADMIN_NAME?: string;
+  GEMINI_MODELS?: string;
   OPENROUTER_MODELS?: string;
   OPENROUTER_DIGEST_MODEL?: string;
   DIGEST_FEEDS?: string;
@@ -44,6 +46,12 @@ export const DEFAULT_FREE_MODELS = [
   'mistralai/mistral-small-3.2-24b-instruct:free',
   'qwen/qwen3-235b-a22b:free',
 ];
+
+/**
+ * Gemini models tried in order before falling back to OpenRouter. gemini-1.5-flash has been
+ * retired by Google (404), so the default is its current Flash successor. Override with GEMINI_MODELS.
+ */
+export const DEFAULT_GEMINI_MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash'];
 
 const list = (v: string | undefined) =>
   (v || '')
@@ -80,9 +88,15 @@ export function buildConfig(env: Env) {
     adminName: env.ADMIN_NAME || 'Prof. Giorgi Khatiashvili',
     adminPassword: env.ADMIN_PASSWORD || '',
 
+    /** Primary AI provider for the chat (and digest). Falls back to OpenRouter silently. */
+    gemini: {
+      apiKey: env.GEMINI_API_KEY || '',
+      models: list(env.GEMINI_MODELS).length ? list(env.GEMINI_MODELS) : DEFAULT_GEMINI_MODELS,
+    },
+
     openrouter: {
       apiKey: env.OPENROUTER_API_KEY || '',
-      /** Models students may pick in the chat; the first is the default. Fallbacks follow the same order. */
+      /** Fallback models when Gemini fails, tried in this order. */
       chatModels,
       /** The digest only ever uses free (":free") models, so it never costs anything. */
       digestModels: [...new Set([env.OPENROUTER_DIGEST_MODEL, ...chatModels].filter((m): m is string => Boolean(m?.endsWith(':free'))))],

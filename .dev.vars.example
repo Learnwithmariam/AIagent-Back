@@ -5,5 +5,6 @@ PUBLIC_APP_URL=http://localhost:5173
 JWT_SECRET=dev-only-change-me
 ADMIN_EMAIL=lecturer@btu.edu.ge
 ADMIN_PASSWORD=change-me-please
+GEMINI_API_KEY=
 OPENROUTER_API_KEY=sk-or-v1-...
 RESEND_API_KEY=

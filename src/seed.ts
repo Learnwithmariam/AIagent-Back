@@ -109,7 +109,7 @@ export const SEED_TESTS: Test[] = [
       'გამოცდა მიმდინარეობს მონიტორინგის რეჟიმში. ტაბის შეცვლა, ფანჯრის მინიმიზაცია და copy/paste ფიქსირდება და ლექტორს ეგზავნება.',
     durationMinutes: 15,
     passingScore: 60,
-    totalPoints: 30,
+    totalPoints: 10,
     startTime: '2026-01-01T00:00:00.000Z',
     endTime: '2030-01-01T00:00:00.000Z',
     status: 'draft',
@@ -122,7 +122,7 @@ export const SEED_TESTS: Test[] = [
         prompt: 'რომელია LTV:CAC თანაფარდობის ზოგადად მიღებული ჯანსაღი ნიშნული ვენჩურული სტარტაპისთვის?',
         options: ['1:1', 'მინიმუმ 3:1', '0.5:1', '100:1'],
         correctAnswer: 1,
-        points: 10,
+        points: 3,
       },
       {
         id: 'q2',
@@ -135,7 +135,7 @@ export const SEED_TESTS: Test[] = [
           'კონკურენტების დაბლოკვა',
         ],
         correctAnswer: 1,
-        points: 10,
+        points: 3,
       },
       {
         id: 'q3',
@@ -143,7 +143,7 @@ export const SEED_TESTS: Test[] = [
         prompt: 'თქვენივე სტარტაპ იდეის მაგალითზე ახსენით, რით განსხვავდება Problem-Solution Fit და Product-Market Fit.',
         rubric:
           'სრული ქულა: (1) PSF — დადასტურებული, მწვავე პრობლემა და გადაწყვეტის მიმართ ვალდებულება (წინასწარი შეკვეთა, LOI, აქტიური გამოყენება). (2) PMF — ბაზრის „pull“, ორგანული რეკომენდაციები, სტაბილური retention. (3) კონკრეტული მაგალითი სტუდენტის საკუთარი იდეიდან.',
-        points: 10,
+        points: 4,
       },
     ],
   },

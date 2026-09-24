@@ -1,6 +1,6 @@
 # G.K. BTU Students — API Worker
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
-name = "gk-btu-students-api"
+name = "aiagent-back"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
 workers_dev = true
@@ -23,23 +23,25 @@ enabled = true
 
 [vars]
 ENVIRONMENT = "production"
-# Comma-separated frontend origins allowed by CORS (your Cloudflare Pages URL + custom domain)
-FRONTEND_URL = "https://gk-btu-students.pages.dev"
-PUBLIC_APP_URL = "https://gk-btu-students.pages.dev"
+# Comma-separated frontend origins allowed by CORS
+FRONTEND_URL = "https://aiagent-front.giorgi-khatiashvili-9e4.workers.dev"
+PUBLIC_APP_URL = "https://aiagent-front.giorgi-khatiashvili-9e4.workers.dev"
 JWT_EXPIRES_IN = "12h"
-ADMIN_EMAIL = ""
+ADMIN_EMAIL = "giorgi.khatiashvili@btu.edu.ge"
 ADMIN_NAME = "Prof. Giorgi Khatiashvili"
-# Free OpenRouter models, tried in this order (first = default). Students can pick among them in the chat.
-# Keep only ":free" ids to stay at zero cost.
+# AI routing (server-side, invisible to students): Gemini models first, in this order...
+# gemini-1.5-flash is retired by Google, so the current Flash models are used.
+GEMINI_MODELS = "gemini-3.6-flash,gemini-3.5-flash"
+# ...then, if Gemini fails, these OpenRouter models in this order. Keep ":free" ids to stay at zero cost.
 # Current free list: https://openrouter.ai/models?max_price=0
 OPENROUTER_MODELS = "meta-llama/llama-3.3-70b-instruct:free,deepseek/deepseek-chat-v3-0324:free,google/gemma-3-27b-it:free,mistralai/mistral-small-3.2-24b-instruct:free,qwen/qwen3-235b-a22b:free"
 # AI is used only for the student chat and for writing digest summaries. Grading is 100% manual.
-# The digest only uses ":free" models; optionally pin one here.
+# The digest's OpenRouter fallback only uses ":free" models; optionally pin one here.
 OPENROUTER_DIGEST_MODEL = ""
 # Free public RSS/Atom feeds for the daily digest (comma-separated). Empty = built-in list
 # (TechCrunch Startups, Crunchbase News, Sifted, EU-Startups, VentureBeat).
 DIGEST_FEEDS = ""
-MAIL_FROM = "G.K. BTU Students <noreply@example.com>"
+MAIL_FROM = "G.K. BTU Students <onboarding@resend.dev>"
 DIGEST_ENABLED = "true"
 DIGEST_TIMEZONE = "Asia/Tbilisi"
 EXAM_MAX_PAUSES = "3"
@@ -48,7 +50,8 @@ EXAM_SUBMIT_GRACE_SECONDS = "60"
 # Secrets — set once with `npx wrangler secret put <NAME>` (never commit them):
 #   JWT_SECRET          long random string
 #   ADMIN_PASSWORD      lecturer's first password (used only when no admin exists yet)
-#   OPENROUTER_API_KEY  https://openrouter.ai/keys
+#   GEMINI_API_KEY      https://aistudio.google.com/apikey (primary AI)
+#   OPENROUTER_API_KEY  https://openrouter.ai/keys (fallback AI)
 #   RESEND_API_KEY      https://resend.com/api-keys (optional; without it passwords are shown once in the UI)
 
 # Local development (`npm run dev`) reads overrides and secrets from .dev.vars

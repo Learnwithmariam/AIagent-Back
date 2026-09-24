@@ -1,13 +1,14 @@
-import type {
-  Student,
-  KnowledgeDoc,
-  Test,
-  TestSubmission,
-  ProctorEvent,
-  DailyDigest,
-  UserAccount,
-  ExamAttempt,
-  ActiveExamSession,
+import {
+  MAX_TEST_POINTS,
+  type Student,
+  type KnowledgeDoc,
+  type Test,
+  type TestSubmission,
+  type ProctorEvent,
+  type DailyDigest,
+  type UserAccount,
+  type ExamAttempt,
+  type ActiveExamSession,
 } from './types';
 import type { Config } from './config';
 import { hashPassword, randomHex } from './auth';
@@ -67,7 +68,72 @@ export class Store {
       for (const t of [...SEED_TESTS].reverse()) this.insert('tests', t);
       this.sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('seeded', '1')`);
     }
+    this.migrateToTenPointScale();
     await this.ensureAdmin();
+  }
+
+  /**
+   * One-off: quizzes used to be scored out of up to 100 points; now the maximum is 10.
+   * Rescales every test above 10 points (and its submissions' scores) proportionally, so
+   * percentages and pass/fail stay the same.
+   */
+  private migrateToTenPointScale() {
+    if (this.sql.exec(`SELECT value FROM meta WHERE key = 'points_max_10'`).toArray().length) return;
+    const r1 = (n: number) => Math.round(n * 10) / 10;
+
+    for (const test of this.data.tests) {
+      const oldPoints = test.questions.map((q) => Number(q.points) || 0);
+      const oldTotal = oldPoints.reduce((a, b) => a + b, 0);
+      if (oldTotal <= MAX_TEST_POINTS) continue;
+
+      // Scale to 10 in half-point steps, handing leftover halves to the largest remainders
+      const exact = oldPoints.map((p) => (p / oldTotal) * MAX_TEST_POINTS);
+      const newPoints = exact.map((x) => Math.max(0.5, Math.floor(x * 2) / 2));
+      let left = MAX_TEST_POINTS - newPoints.reduce((a, b) => a + b, 0);
+      const byRemainder = exact.map((x, i) => ({ i, r: x - newPoints[i] })).sort((a, b) => b.r - a.r);
+      for (let k = 0; left >= 0.5 && byRemainder.length; k = (k + 1) % byRemainder.length) {
+        newPoints[byRemainder[k].i] += 0.5;
+        left -= 0.5;
+      }
+      // Many tiny questions can overshoot because of the 0.5 minimum: trim from the largest
+      while (left < 0 && newPoints.some((p) => p > 0.5)) {
+        const i = newPoints.indexOf(Math.max(...newPoints));
+        newPoints[i] -= 0.5;
+        left += 0.5;
+      }
+      const factor = new Map(test.questions.map((q, i) => [q.id, oldPoints[i] > 0 ? newPoints[i] / oldPoints[i] : 0]));
+      test.questions.forEach((q, i) => (q.points = newPoints[i]));
+      test.totalPoints = r1(newPoints.reduce((a, b) => a + b, 0));
+      this.save('tests', test);
+
+      for (const sub of this.data.submissions.filter((x) => x.testId === test.id)) {
+        const grading = sub.grading || sub.questionGradings || {};
+        for (const g of Object.values(grading)) {
+          const f = factor.get(g.questionId) ?? MAX_TEST_POINTS / oldTotal;
+          g.earnedPoints = r1(g.earnedPoints * f);
+          g.maxPoints = r1(g.maxPoints * f);
+        }
+        sub.grading = grading;
+        sub.questionGradings = grading;
+        sub.totalScore = r1(Object.values(grading).reduce((n, g) => n + g.earnedPoints, 0));
+        sub.maxScore = test.totalPoints;
+        this.save('submissions', sub);
+      }
+    }
+
+    // Submissions whose test was deleted: scale the totals only
+    for (const sub of this.data.submissions) {
+      if (sub.maxScore <= MAX_TEST_POINTS || this.getTestById(sub.testId)) continue;
+      const f = MAX_TEST_POINTS / sub.maxScore;
+      for (const g of Object.values(sub.grading || sub.questionGradings || {})) {
+        g.earnedPoints = r1(g.earnedPoints * f);
+        g.maxPoints = r1(g.maxPoints * f);
+      }
+      sub.totalScore = r1(sub.totalScore * f);
+      sub.maxScore = MAX_TEST_POINTS;
+      this.save('submissions', sub);
+    }
+    this.sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('points_max_10', '1')`);
   }
 
   private load() {
@@ -147,6 +213,9 @@ export class Store {
       }
     }
     this.sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('seeded', '1')`);
+    // imported data may still be on the old 100-point scale
+    this.sql.exec(`DELETE FROM meta WHERE key = 'points_max_10'`);
+    this.migrateToTenPointScale();
     return Object.fromEntries(ALL.map((n) => [n, this.data[n].length]));
   }
 
@@ -228,6 +297,56 @@ export class Store {
     return { student, created: true };
   }
 
+  /** Edit a student's profile (and matching login). An email change also moves their records. */
+  updateStudent(
+    email: string,
+    updates: { name?: string; email?: string; department?: string; digestSubscribed?: boolean }
+  ): Student | 'not_found' | 'email_taken' {
+    const student = this.getStudentByEmail(email);
+    if (!student) return 'not_found';
+    const oldEmail = student.email.toLowerCase();
+    const newEmail = updates.email?.trim().toLowerCase() || oldEmail;
+    if (newEmail !== oldEmail && (this.getStudentByEmail(newEmail) || this.getUserByEmail(newEmail))) return 'email_taken';
+
+    if (updates.name !== undefined) student.name = updates.name;
+    if (updates.department !== undefined) student.department = updates.department;
+    if (updates.digestSubscribed !== undefined) student.digestSubscribed = updates.digestSubscribed;
+    student.email = newEmail;
+    this.save('students', student);
+
+    const user = this.data.users.find((u) => u.role === 'student' && u.email.toLowerCase() === oldEmail);
+    if (user) {
+      user.email = newEmail;
+      user.name = student.name;
+      user.department = student.department;
+      this.save('users', user);
+    }
+
+    if (newEmail !== oldEmail) {
+      for (const s of this.data.submissions.filter((x) => x.studentEmail.toLowerCase() === oldEmail)) {
+        s.studentEmail = newEmail;
+        s.studentName = student.name;
+        this.save('submissions', s);
+      }
+      for (const a of this.data.attempts.filter((x) => x.studentEmail.toLowerCase() === oldEmail)) {
+        a.studentEmail = newEmail;
+        this.save('attempts', a);
+      }
+      for (const e of this.data.proctorEvents.filter((x) => x.studentEmail.toLowerCase() === oldEmail)) {
+        e.studentEmail = newEmail;
+        this.save('proctorEvents', e);
+      }
+      // live sessions are keyed by email; the student simply rejoins under the new one
+      this.remove('sessions', (x) => x.studentEmail === oldEmail);
+    } else if (updates.name !== undefined) {
+      for (const s of this.data.submissions.filter((x) => x.studentEmail.toLowerCase() === oldEmail)) {
+        s.studentName = student.name;
+        this.save('submissions', s);
+      }
+    }
+    return student;
+  }
+
   deleteStudent(email: string): boolean {
     const e = email.toLowerCase();
     const removed = this.remove('students', (s) => s.email.toLowerCase() === e);
@@ -279,7 +398,7 @@ export class Store {
     const { id: _ignore, createdAt: _c, ...safe } = updates;
     Object.assign(test, safe);
     if (Array.isArray(test.questions)) {
-      test.totalPoints = test.questions.reduce((acc, q) => acc + (Number(q.points) || 0), 0);
+      test.totalPoints = Math.round(test.questions.reduce((acc, q) => acc + (Number(q.points) || 0), 0) * 10) / 10;
     }
     this.save('tests', test);
     return test;
