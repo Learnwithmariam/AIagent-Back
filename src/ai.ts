@@ -11,6 +11,7 @@ import type { NewsItem } from './news';
 // never for grading.
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const MODELS_URL = 'https://openrouter.ai/api/v1/models';
 
 type Msg = { role: 'system' | 'user' | 'assistant'; content: string };
 
@@ -22,9 +23,66 @@ interface CompletionResult {
 class AIError extends Error {
   constructor(
     message: string,
-    public retryable: boolean
+    public retryable: boolean,
+    public status = 0
   ) {
     super(message);
+  }
+}
+
+// ---------------------------------------------------------------------
+// Free-model pool, discovered at runtime
+// ---------------------------------------------------------------------
+// OpenRouter's free catalogue changes often: models move to paid-only without notice (a
+// hard-coded list broke exactly this way). So we read the live catalogue, keep every model
+// whose prompt AND completion price is 0, and cache it for an hour. Students never choose a
+// model — the server picks, and falls through the pool on any failure.
+
+const POOL_TTL_MS = 60 * 60_000;
+const DEAD_TTL_MS = 60 * 60_000;
+let poolCache: { at: number; models: string[] } | null = null;
+/** model id → time it answered 404/"not free"; skipped for an hour */
+const deadModels = new Map<string, number>();
+
+// Families that follow instructions and write good Georgian, tried before the rest
+const PREFERRED = ['deepseek', 'llama-3.3', 'llama-4', 'qwen3', 'qwen-2.5', 'gemma-3', 'gpt-oss', 'mistral', 'glm', 'kimi'];
+const rank = (id: string) => {
+  const i = PREFERRED.findIndex((p) => id.includes(p));
+  return i === -1 ? PREFERRED.length : i;
+};
+
+async function freeModelPool(config: Config): Promise<string[]> {
+  if (poolCache && Date.now() - poolCache.at < POOL_TTL_MS) return poolCache.models;
+  try {
+    const res = await fetch(MODELS_URL, {
+      headers: { Authorization: `Bearer ${config.openrouter.apiKey}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`models list HTTP ${res.status}`);
+    const { data } = (await res.json()) as { data: any[] };
+    const free = (data || []).filter(
+      (m) =>
+        m?.id &&
+        Number(m.pricing?.prompt) === 0 &&
+        Number(m.pricing?.completion) === 0 &&
+        !/auto|embed|vision-only|image/i.test(m.id) &&
+        (m.context_length || 0) >= 16_000 &&
+        (m.architecture?.output_modalities ? m.architecture.output_modalities.includes('text') : true)
+    );
+    const ids = free
+      .sort((a, b) => rank(a.id) - rank(b.id) || (b.context_length || 0) - (a.context_length || 0))
+      .map((m) => m.id as string);
+    // OpenRouter's own free router goes first when available; admin-pinned models next
+    const router = ids.filter((id) => id === 'openrouter/free');
+    const pinned = config.openrouter.chatModels.filter((id) => ids.includes(id));
+    const models = [...new Set([...router, ...pinned, ...ids])];
+    if (!models.length) throw new Error('catalogue has no free text models');
+    poolCache = { at: Date.now(), models };
+    console.log(`OpenRouter free pool (${models.length}): ${models.slice(0, 8).join(', ')}${models.length > 8 ? ', …' : ''}`);
+    return models;
+  } catch (err) {
+    console.warn('Could not load OpenRouter catalogue, using fallback list:', String((err as Error)?.message || err));
+    return poolCache?.models || ['openrouter/free', ...config.openrouter.chatModels];
   }
 }
 
@@ -49,62 +107,77 @@ async function callModel(
       temperature: opts.temperature ?? 0.5,
       max_tokens: opts.maxTokens ?? 1500,
     }),
-    signal: AbortSignal.timeout(60_000),
+    signal: AbortSignal.timeout(25_000),
   });
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    // 429 = free-tier rate limit, 5xx = provider down, 404/400 = model removed from the free catalogue
-    const retryable = res.status === 429 || res.status >= 500 || res.status === 404 || res.status === 400;
-    throw new AIError(`OpenRouter ${res.status} for ${model}: ${body.slice(0, 300)}`, retryable);
+    // 401 = bad key: no point trying other models. Anything else (404 not free anymore,
+    // 429 rate limit, 402/403 provider policy, 5xx outage) → try the next model.
+    throw new AIError(`OpenRouter ${res.status} for ${model}: ${body.slice(0, 200)}`, res.status !== 401, res.status);
   }
 
   const data: any = await res.json();
-  if (data?.error) throw new AIError(`OpenRouter error for ${model}: ${JSON.stringify(data.error).slice(0, 300)}`, true);
+  if (data?.error) throw new AIError(`OpenRouter error for ${model}: ${JSON.stringify(data.error).slice(0, 200)}`, true);
   const message = data?.choices?.[0]?.message;
-  const text = typeof message?.content === 'string' ? message.content.trim() : '';
+  const text = typeof message?.content === 'string' ? message.content.replace(/<think>[\s\S]*?<\/think>/g, '').trim() : '';
   if (!text) throw new AIError(`Empty reply from ${model}`, true);
 
   return { text, model: data.model || model };
 }
 
-/** Try `preferred` first, then the rest of the configured free models. */
+/**
+ * Runs a completion on the free pool: tries models in order until one answers, skipping ones
+ * that recently proved dead. Gives up after ~45s so a student never waits indefinitely.
+ */
 async function complete(
   config: Config,
   messages: Msg[],
-  opts: { preferred?: string; temperature?: number; maxTokens?: number; models?: string[] } = {}
+  opts: { temperature?: number; maxTokens?: number; maxAttempts?: number } = {}
 ): Promise<CompletionResult> {
   if (!config.openrouter.apiKey) throw new Error('OPENROUTER_API_KEY is not configured on the server.');
-  const pool = opts.models || config.openrouter.chatModels;
-  const candidates = [...new Set([opts.preferred, ...pool].filter(Boolean) as string[])];
-  let lastError: unknown;
+  const now = Date.now();
+  for (const [id, at] of deadModels) if (now - at > DEAD_TTL_MS) deadModels.delete(id);
+  const candidates = (await freeModelPool(config)).filter((id) => !deadModels.has(id));
+  const deadline = now + 45_000;
+  let lastError: unknown = new Error('No free model available');
+  let attempts = 0;
   for (const model of candidates) {
+    if (attempts++ >= (opts.maxAttempts ?? 8) || Date.now() > deadline) break;
     try {
       return await callModel(config, model, messages, opts);
     } catch (err) {
       lastError = err;
       console.warn(String((err as Error)?.message || err));
+      if (err instanceof AIError && err.status === 404) deadModels.set(model, Date.now());
       if (err instanceof AIError && !err.retryable) break;
     }
   }
   throw lastError instanceof Error ? lastError : new Error('All AI models failed');
 }
 
-/** Models the chat UI may offer. Only these ids are accepted from the client. */
-export function availableModels(config: Config) {
-  return {
-    default: config.openrouter.chatModels[0],
-    models: config.openrouter.chatModels.map((id) => ({ id, label: prettyModelName(id), free: id.endsWith(':free') })),
-    configured: Boolean(config.openrouter.apiKey),
-  };
+/** Whether the chat can work at all (key present). The model is always chosen by the server. */
+export function aiStatus(config: Config) {
+  return { configured: Boolean(config.openrouter.apiKey) };
 }
 
-function prettyModelName(id: string): string {
-  const name = id.split('/').pop()!.replace(/:free$/, '');
-  return name
-    .split('-')
-    .map((p) => (/^\d/.test(p) || p.length <= 3 ? p.toUpperCase() : p[0].toUpperCase() + p.slice(1)))
-    .join(' ');
+/**
+ * Tiny end-to-end probe for monitoring: one short call on the free pool. Cached for 5 minutes so
+ * the public endpoint can't be used to burn the free quota. Never returns raw provider errors.
+ */
+let probeCache: { at: number; result: { ok: boolean; model?: string; poolSize: number; status?: number } } | null = null;
+export async function aiHealth(config: Config) {
+  if (probeCache && Date.now() - probeCache.at < 5 * 60_000) return { ...probeCache.result, cached: true };
+  const poolSize = config.openrouter.apiKey ? (await freeModelPool(config)).length : 0;
+  let result: { ok: boolean; model?: string; poolSize: number; status?: number };
+  try {
+    const r = await complete(config, [{ role: 'user', content: 'Reply with the single word: OK' }], { maxTokens: 400, temperature: 0, maxAttempts: 5 });
+    result = { ok: true, model: r.model, poolSize };
+  } catch (err) {
+    result = { ok: false, poolSize, status: err instanceof AIError ? err.status : undefined };
+  }
+  probeCache = { at: Date.now(), result };
+  return { ...result, cached: false };
 }
 
 /** Strip ```json fences and parse. */
@@ -200,14 +273,12 @@ export async function chatWithTeachingAgent(
     knowledgeDocs,
     language = 'ka',
     studentName,
-    model,
   }: {
     message: string;
     history: { role: 'user' | 'assistant'; content: string }[];
     knowledgeDocs: KnowledgeDoc[];
     language?: string;
     studentName?: string;
-    model?: string;
   }
 ): Promise<{ reply: string; model: string; citations: { docId: string; title: string; snippet: string }[] }> {
   const chunks = retrieve(knowledgeDocs, `${message} ${history.slice(-2).map((h) => h.content).join(' ')}`);
@@ -237,7 +308,7 @@ ${context || '(no materials uploaded yet)'}`;
     { role: 'user', content: message.slice(0, 4000) },
   ];
 
-  const result = await complete(config, messages, { preferred: model, temperature: 0.5 });
+  const result = await complete(config, messages, { temperature: 0.5 });
   const reply = result.text.replace(/<think>[\s\S]*?<\/think>/g, '').trim() || (isKa ? 'პასუხის გენერირება ვერ მოხერხდა.' : 'Could not generate a reply.');
 
   // Cite (title + summary only — never raw content) the docs whose titles show up in the reply
@@ -273,8 +344,6 @@ export async function writeDigestFromNews(
   { items, subjectFocus, language = 'ka' }: { items: NewsItem[]; subjectFocus: string; language?: string }
 ): Promise<DigestContent> {
   const isKa = language === 'ka';
-  const freeModels = config.openrouter.digestModels;
-  if (!freeModels.length) throw new Error('No free (":free") OpenRouter model is configured for the digest.');
 
   const list = items
     .map((it, i) => `[${i + 1}] ${it.title}\nSource: ${it.source} · ${it.publishedAt.slice(0, 10)}\n${it.description.slice(0, 500)}`)
@@ -295,8 +364,6 @@ Return ONLY a JSON object (no markdown):
  "challengeQuestion": {"question": string, "options": [string,string,string,string], "explanation": string (which option is correct and why)}}`;
 
   const result = await complete(config, [{ role: 'user', content: prompt }], {
-    preferred: freeModels[0],
-    models: freeModels,
     temperature: 0.4,
     maxTokens: 2500,
   });

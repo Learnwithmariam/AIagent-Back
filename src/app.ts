@@ -6,7 +6,7 @@ import type { Store } from './store';
 import type { ProctorHub } from './proctor';
 import type { Mailer } from './mailer';
 import type { DigestService } from './digest';
-import { availableModels, chatWithTeachingAgent } from './ai';
+import { aiHealth, aiStatus, chatWithTeachingAgent } from './ai';
 import { extractTextFromFile } from './extract';
 import { signToken, verifyToken, verifyPassword, isLegacyHash, publicUser, generateTempPassword, type TokenPayload } from './auth';
 import type { Question, QuestionGrading, Test, TestSubmission, ProctorSummary } from './types';
@@ -159,6 +159,8 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   // Health
   // -------------------------------------------------------------------------
   app.get('/api/health', (c) => c.json({ status: 'ok', app: APP_NAME, runtime: 'cloudflare-workers', timestamp: new Date().toISOString() }));
+  /** Public AI probe for monitoring (cached 5 min, no provider details): is any free model answering? */
+  app.get('/api/health/ai', async (c) => c.json(await aiHealth(config)));
 
   // -------------------------------------------------------------------------
   // Live proctoring WebSocket
@@ -586,15 +588,13 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   // -------------------------------------------------------------------------
   // AI teaching agent (OpenRouter)
   // -------------------------------------------------------------------------
-  app.get('/api/ai/models', requireAuth, (c) => c.json(availableModels(config)));
+  app.get('/api/ai/status', requireAuth, (c) => c.json(aiStatus(config)));
 
   const chatHandler = async (c: Context<AppEnv>) => {
     const b = await body(c);
     const { message, language } = b || {};
     const history = b?.history || b?.conversationHistory || [];
     if (!message || typeof message !== 'string') return c.json({ error: 'Message is required' }, 400);
-    // Only models from the server's allow-list — the client can't route to arbitrary (paid) models
-    const model = config.openrouter.chatModels.includes(b?.model) ? b.model : undefined;
     try {
       const result = await chatWithTeachingAgent(config, {
         message,
@@ -606,7 +606,6 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
         knowledgeDocs: store.getKnowledgeDocs(),
         language: language === 'en' ? 'en' : 'ka',
         studentName: c.get('user').name,
-        model,
       });
       return c.json(result);
     } catch (err: any) {

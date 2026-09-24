@@ -21,7 +21,6 @@ export interface Env {
   ADMIN_EMAIL?: string;
   ADMIN_NAME?: string;
   OPENROUTER_MODELS?: string;
-  OPENROUTER_DIGEST_MODEL?: string;
   DIGEST_FEEDS?: string;
   MAIL_FROM?: string;
   DIGEST_ENABLED?: string;
@@ -31,19 +30,6 @@ export interface Env {
 }
 
 export const APP_NAME = 'G.K. BTU Students';
-
-/**
- * Free OpenRouter models tried in order when OPENROUTER_MODELS isn't set.
- * The free catalogue changes often — check https://openrouter.ai/models?max_price=0
- * and override the list in wrangler.toml instead of editing code.
- */
-export const DEFAULT_FREE_MODELS = [
-  'meta-llama/llama-3.3-70b-instruct:free',
-  'deepseek/deepseek-chat-v3-0324:free',
-  'google/gemma-3-27b-it:free',
-  'mistralai/mistral-small-3.2-24b-instruct:free',
-  'qwen/qwen3-235b-a22b:free',
-];
 
 const list = (v: string | undefined) =>
   (v || '')
@@ -65,7 +51,9 @@ export function buildConfig(env: Env) {
     throw new Error('Missing required secret JWT_SECRET (wrangler secret put JWT_SECRET)');
   }
   const models = list(env.OPENROUTER_MODELS);
-  const chatModels = models.length ? models : DEFAULT_FREE_MODELS;
+  // Optional: free model ids to try first. Normally empty — the server discovers OpenRouter's
+  // current free models at runtime (see ai.ts), because that catalogue changes without notice.
+  const chatModels = models;
 
   return {
     isProd,
@@ -84,8 +72,6 @@ export function buildConfig(env: Env) {
       apiKey: env.OPENROUTER_API_KEY || '',
       /** Models students may pick in the chat; the first is the default. Fallbacks follow the same order. */
       chatModels,
-      /** The digest only ever uses free (":free") models, so it never costs anything. */
-      digestModels: [...new Set([env.OPENROUTER_DIGEST_MODEL, ...chatModels].filter((m): m is string => Boolean(m?.endsWith(':free'))))],
     },
 
     mail: {

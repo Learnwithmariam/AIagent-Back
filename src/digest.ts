@@ -78,7 +78,7 @@ export class DigestService {
       schedule: cronSchedule,
       newsSource: 'rss',
       feeds: this.config.digest.feeds,
-      aiModels: this.config.openrouter.digestModels,
+      aiModels: 'OpenRouter free pool (auto)',
       timezone: this.config.digest.timezone,
       nextScheduledAt: `${cronSchedule} (UTC)`,
       delivery: 'in-app',

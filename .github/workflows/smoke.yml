@@ -1,0 +1,38 @@
+name: Live smoke test
+
+# Checks the deployed app from outside: API health, a real free-model AI call, and the frontend.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/exciting-gauss-v4myn9]
+    paths: ['.github/workflows/smoke.yml', 'src/**']
+  schedule:
+    - cron: '0 6 * * *'
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    env:
+      API: https://aiagent-back.giorgi-khatiashvili-9e4.workers.dev
+      APP: https://aiagent-front.giorgi-khatiashvili-9e4.workers.dev
+    steps:
+      - name: API health
+        run: curl -fsS "$API/api/health"; echo
+      - name: AI answers (free model pool)
+        run: |
+          sleep 20   # give a fresh deploy time to roll out
+          for i in 1 2 3; do
+            r=$(curl -sS -m 90 "$API/api/health/ai"); echo "$r"
+            echo "$r" | grep -q '"ok":true' && exit 0
+            sleep 330  # probe result is cached for 5 minutes
+          done
+          exit 1
+      - name: Frontend serves the app
+        run: |
+          curl -fsS "$APP/" | grep -q '<div id="root">'
+          curl -fsS "$APP/some/deep/link" | grep -q '<div id="root">'   # SPA fallback
+          echo "frontend OK"
+      - name: CORS allows the frontend
+        run: |
+          curl -sSI -X OPTIONS "$API/api/auth/login" -H "Origin: $APP" -H 'Access-Control-Request-Method: POST' | tee h.txt
+          grep -qi "access-control-allow-origin: $APP" h.txt

@@ -30,13 +30,11 @@ PUBLIC_APP_URL = "https://aiagent-front.giorgi-khatiashvili-9e4.workers.dev"
 JWT_EXPIRES_IN = "12h"
 ADMIN_EMAIL = "giorgi.khatiashvili@btu.edu.ge"
 ADMIN_NAME = "Prof. Giorgi Khatiashvili"
-# Free OpenRouter models, tried in this order (first = default). Students can pick among them in the chat.
-# Keep only ":free" ids to stay at zero cost.
-# Current free list: https://openrouter.ai/models?max_price=0
-OPENROUTER_MODELS = "meta-llama/llama-3.3-70b-instruct:free,deepseek/deepseek-chat-v3-0324:free,google/gemma-3-27b-it:free,mistralai/mistral-small-3.2-24b-instruct:free,qwen/qwen3-235b-a22b:free"
 # AI is used only for the student chat and for writing digest summaries. Grading is 100% manual.
-# The digest only uses ":free" models; optionally pin one here.
-OPENROUTER_DIGEST_MODEL = ""
+# Models are chosen automatically: the server reads OpenRouter's live catalogue, keeps only
+# zero-price models and falls through them on any error. Students never pick a model.
+# Optional: free model ids to try first (ids that aren't currently free are ignored).
+OPENROUTER_MODELS = ""
 # Free public RSS/Atom feeds for the daily digest (comma-separated). Empty = built-in list
 # (TechCrunch Startups, Crunchbase News, Sifted, EU-Startups, VentureBeat).
 DIGEST_FEEDS = ""
