@@ -4,7 +4,7 @@ Backend for the BTU course **Innovative Entrepreneurship & Startups**:
 
 - **AI teaching assistant** — a chatbot for students' questions about startups, entrepreneurship and innovation, grounded in the syllabus (RAG) and answered by **free OpenRouter models**. Students can pick a model; if one is rate-limited the next one in the list answers.
 - **Proctored exams, graded by hand** — the server owns the timer and attempts; tab switches, copy/paste, etc. reach the lecturer live over WebSockets. **AI never grades anything**: every submission waits for the lecturer, and students see no score until the lecturer publishes it.
-- **Morning digest, 100% free** — every day at 08:00 Tbilisi time. News comes from free public **RSS feeds**; a free (`:free`) model only writes the Georgian summaries. Emailed via Resend.
+- **Morning digest, 100% free** — every day at 08:00 Tbilisi time. News comes from free public **RSS feeds**; a free (`:free`) model only writes the Georgian summaries. **In-app only — never emailed.**
 
 ## Architecture
 
@@ -20,7 +20,7 @@ Browser ──HTTPS/WSS──▶ Worker (src/index.ts)
                           │
                           ├──▶ RSS feeds (free news)                 src/news.ts
                           ├──▶ OpenRouter free models (chat, digest)  src/ai.ts
-                          └──▶ Resend (email)                        src/mailer.ts
+                          └──▶ Resend (account emails only)          src/mailer.ts
 ```
 
 One Durable Object holds the whole course. That gives one consistent exam clock, and every proctoring event reaches every lecturer dashboard. It's plenty for one course (hundreds of students).
@@ -70,7 +70,7 @@ npm run dev                      # http://localhost:8787
 | `OPENROUTER_MODELS` | var | Comma-separated free models; the first is the default. See https://openrouter.ai/models?max_price=0 |
 | `OPENROUTER_DIGEST_MODEL` | var | Optional. The digest only ever uses `:free` models, whatever is configured |
 | `DIGEST_FEEDS` | var | Comma-separated RSS/Atom feeds for the digest. Empty = TechCrunch Startups, Crunchbase News, Sifted, EU-Startups, VentureBeat |
-| `RESEND_API_KEY`, `MAIL_FROM` | secret / var | Email. Without it, temporary passwords are shown once to the lecturer |
+| `RESEND_API_KEY`, `MAIL_FROM` | secret / var | **Account emails only**: new account + temporary password, password reset. The digest is never emailed, which keeps usage far below Resend's free limit. Without a key, the temporary password is shown once to the lecturer. `MAIL_FROM` must use a domain verified in Resend (until then `onboarding@resend.dev` only delivers to your own Resend address) |
 | `FRONTEND_URL` | var | Allowed CORS origins, comma-separated |
 | `EXAM_MAX_PAUSES` | var | Pause credits per attempt; `0` disables pausing |
 

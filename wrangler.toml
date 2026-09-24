@@ -23,11 +23,12 @@ enabled = true
 
 [vars]
 ENVIRONMENT = "production"
-# Comma-separated frontend origins allowed by CORS (your Cloudflare Pages URL + custom domain)
-FRONTEND_URL = "https://gk-btu-students.pages.dev"
-PUBLIC_APP_URL = "https://gk-btu-students.pages.dev"
+# Comma-separated frontend origins allowed by CORS. Replace <subdomain> with your account's
+# workers.dev subdomain (shown by `wrangler deploy` in the frontend repo), or use a custom domain.
+FRONTEND_URL = "https://gk-btu-students.<subdomain>.workers.dev"
+PUBLIC_APP_URL = "https://gk-btu-students.<subdomain>.workers.dev"
 JWT_EXPIRES_IN = "12h"
-ADMIN_EMAIL = ""
+ADMIN_EMAIL = "giorgi.khatiashvili@btu.edu.ge"
 ADMIN_NAME = "Prof. Giorgi Khatiashvili"
 # Free OpenRouter models, tried in this order (first = default). Students can pick among them in the chat.
 # Keep only ":free" ids to stay at zero cost.
@@ -39,7 +40,10 @@ OPENROUTER_DIGEST_MODEL = ""
 # Free public RSS/Atom feeds for the daily digest (comma-separated). Empty = built-in list
 # (TechCrunch Startups, Crunchbase News, Sifted, EU-Startups, VentureBeat).
 DIGEST_FEEDS = ""
-MAIL_FROM = "G.K. BTU Students <noreply@example.com>"
+# Resend is used ONLY for account emails (welcome + temporary password, password reset).
+# The daily digest is in-app only and never emailed. The sender domain must be verified in Resend;
+# until then Resend only delivers to your own Resend account address from onboarding@resend.dev.
+MAIL_FROM = "G.K. BTU Students <onboarding@resend.dev>"
 DIGEST_ENABLED = "true"
 DIGEST_TIMEZONE = "Asia/Tbilisi"
 EXAM_MAX_PAUSES = "3"
@@ -49,6 +53,7 @@ EXAM_SUBMIT_GRACE_SECONDS = "60"
 #   JWT_SECRET          long random string
 #   ADMIN_PASSWORD      lecturer's first password (used only when no admin exists yet)
 #   OPENROUTER_API_KEY  https://openrouter.ai/keys
-#   RESEND_API_KEY      https://resend.com/api-keys (optional; without it passwords are shown once in the UI)
+#   RESEND_API_KEY      https://resend.com/api-keys (account emails only; without it the temporary
+#                       password is shown once to the lecturer instead)
 
 # Local development (`npm run dev`) reads overrides and secrets from .dev.vars
