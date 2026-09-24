@@ -30,12 +30,15 @@ JWT_EXPIRES_IN = "12h"
 ADMIN_EMAIL = ""
 ADMIN_NAME = "Prof. Giorgi Khatiashvili"
 # Free OpenRouter models, tried in this order (first = default). Students can pick among them in the chat.
+# Keep only ":free" ids to stay at zero cost.
 # Current free list: https://openrouter.ai/models?max_price=0
 OPENROUTER_MODELS = "meta-llama/llama-3.3-70b-instruct:free,deepseek/deepseek-chat-v3-0324:free,google/gemma-3-27b-it:free,mistralai/mistral-small-3.2-24b-instruct:free,qwen/qwen3-235b-a22b:free"
-OPENROUTER_GRADING_MODEL = ""
+# AI is used only for the student chat and for writing digest summaries. Grading is 100% manual.
+# The digest only uses ":free" models; optionally pin one here.
 OPENROUTER_DIGEST_MODEL = ""
-# The digest must be grounded in real news: OpenRouter's web plugin (billed per search, ~$0.02/run)
-OPENROUTER_DIGEST_WEB_SEARCH = "true"
+# Free public RSS/Atom feeds for the daily digest (comma-separated). Empty = built-in list
+# (TechCrunch Startups, Crunchbase News, Sifted, EU-Startups, VentureBeat).
+DIGEST_FEEDS = ""
 MAIL_FROM = "G.K. BTU Students <noreply@example.com>"
 DIGEST_ENABLED = "true"
 DIGEST_TIMEZONE = "Asia/Tbilisi"

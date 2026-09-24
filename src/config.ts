@@ -1,3 +1,5 @@
+import { DEFAULT_FEEDS } from './news';
+
 /**
  * Runtime configuration, built from the Worker's bindings.
  * Plain values live in wrangler.toml [vars]; secrets are set with `wrangler secret put <NAME>`.
@@ -19,9 +21,8 @@ export interface Env {
   ADMIN_EMAIL?: string;
   ADMIN_NAME?: string;
   OPENROUTER_MODELS?: string;
-  OPENROUTER_GRADING_MODEL?: string;
   OPENROUTER_DIGEST_MODEL?: string;
-  OPENROUTER_DIGEST_WEB_SEARCH?: string;
+  DIGEST_FEEDS?: string;
   MAIL_FROM?: string;
   DIGEST_ENABLED?: string;
   DIGEST_TIMEZONE?: string;
@@ -83,10 +84,8 @@ export function buildConfig(env: Env) {
       apiKey: env.OPENROUTER_API_KEY || '',
       /** Models students may pick in the chat; the first is the default. Fallbacks follow the same order. */
       chatModels,
-      gradingModel: env.OPENROUTER_GRADING_MODEL || chatModels[0],
-      digestModel: env.OPENROUTER_DIGEST_MODEL || chatModels[0],
-      /** OpenRouter's web plugin grounds the digest in real news. It is billed per search, not free. */
-      digestWebSearch: env.OPENROUTER_DIGEST_WEB_SEARCH !== 'false',
+      /** The digest only ever uses free (":free") models, so it never costs anything. */
+      digestModels: [...new Set([env.OPENROUTER_DIGEST_MODEL, ...chatModels].filter((m): m is string => Boolean(m?.endsWith(':free'))))],
     },
 
     mail: {
@@ -96,6 +95,8 @@ export function buildConfig(env: Env) {
 
     digest: {
       enabled: env.DIGEST_ENABLED !== 'false',
+      /** Free public RSS/Atom feeds the digest reads news from */
+      feeds: list(env.DIGEST_FEEDS).length ? list(env.DIGEST_FEEDS) : DEFAULT_FEEDS,
       timezone: env.DIGEST_TIMEZONE || 'Asia/Tbilisi',
     },
 

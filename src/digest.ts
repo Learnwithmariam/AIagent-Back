@@ -1,6 +1,7 @@
 import type { Store } from './store';
 import { APP_NAME, type Config } from './config';
-import { generateDailyDigestContent, type DigestContent } from './ai';
+import { writeDigestFromNews, type DigestContent } from './ai';
+import { collectNews } from './news';
 import { escapeHtml, type Mailer } from './mailer';
 import type { DailyDigest } from './types';
 
@@ -65,7 +66,11 @@ export class DigestService {
     if (this.isRunning) throw new Error('Digest generation is already in progress.');
     this.isRunning = true;
     try {
-      const content = await generateDailyDigestContent(this.config, { subjectFocus, language });
+      // 1. real news from free RSS feeds  2. a free model writes the summaries
+      const { items, failedFeeds } = await collectNews(this.config.digest.feeds);
+      if (failedFeeds.length) console.warn('Digest feeds unavailable:', failedFeeds.join(', '));
+      if (items.length < 2) throw new Error('Not enough recent news in the RSS feeds — digest skipped.');
+      const content = await writeDigestFromNews(this.config, { items, subjectFocus, language });
       const emailHtml = renderEmail(content, this.config);
       const subscribed = this.store.getStudents().filter((s) => s.digestSubscribed);
 
@@ -107,6 +112,9 @@ export class DigestService {
       lastError: this.lastError,
       enabled: this.config.digest.enabled,
       schedule: cronSchedule,
+      newsSource: 'rss',
+      feeds: this.config.digest.feeds,
+      aiModels: this.config.openrouter.digestModels,
       timezone: this.config.digest.timezone,
       nextScheduledAt: `${cronSchedule} (UTC)`,
       smtpConfigured: this.mailer.isConfigured,

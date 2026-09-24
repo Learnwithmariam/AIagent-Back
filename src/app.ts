@@ -6,7 +6,7 @@ import type { Store } from './store';
 import type { ProctorHub } from './proctor';
 import type { Mailer } from './mailer';
 import type { DigestService } from './digest';
-import { availableModels, chatWithTeachingAgent, gradeQuestionWithAI } from './ai';
+import { availableModels, chatWithTeachingAgent } from './ai';
 import { extractTextFromFile } from './extract';
 import { signToken, verifyToken, verifyPassword, isLegacyHash, publicUser, generateTempPassword, type TokenPayload } from './auth';
 import type { Question, QuestionGrading, Test, TestSubmission, ProctorSummary } from './types';
@@ -474,7 +474,7 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     const { testId, studentEmail } = c.req.query();
     const user = c.get('user');
     if (user.role === 'admin') return c.json(store.getSubmissions(testId, studentEmail));
-    return c.json(store.getSubmissions(testId, user.email));
+    return c.json(store.getSubmissions(testId, user.email).map(forStudent));
   });
 
   app.get('/api/submissions/:id', requireAuth, (c) => {
@@ -484,8 +484,17 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     if (user.role !== 'admin' && sub.studentEmail.toLowerCase() !== user.email.toLowerCase()) {
       return c.json({ error: 'Forbidden' }, 403);
     }
-    return c.json(sub);
+    return c.json(user.role === 'admin' ? sub : forStudent(sub));
   });
+
+  /**
+   * Grading is 100% manual. Until the lecturer publishes a grade, a student sees their answers
+   * and the integrity summary, but no points, pass/fail or feedback.
+   */
+  function forStudent(sub: TestSubmission): TestSubmission {
+    if (sub.status === 'graded') return sub;
+    return { ...sub, grading: {}, questionGradings: {}, totalScore: 0, percentage: 0, passed: false };
+  }
 
   app.post('/api/submissions', requireAuth, async (c) => {
     const user = c.get('user');
@@ -511,44 +520,13 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     store.saveAttempt(attempt);
 
     const answers: Record<string, string | number> = b?.answers && typeof b.answers === 'object' ? b.answers : {};
-    const language = b?.language === 'en' ? 'en' : 'ka';
-
-    const grading: Record<string, QuestionGrading> = {};
-    let totalScore = 0;
-    let needsReview = false;
-
-    await Promise.all(
-      test.questions.map(async (q) => {
-        const ans = answers[q.id];
-        if (q.type === 'mcq') {
-          const answered = ans !== undefined && ans !== null && ans !== '';
-          const isCorrect = answered && Number(ans) === Number(q.correctAnswer);
-          const earned = isCorrect ? q.points : 0;
-          totalScore += earned;
-          grading[q.id] = {
-            questionId: q.id,
-            earnedPoints: earned,
-            maxPoints: q.points,
-            isCorrect,
-            // Don't reveal the correct option — other students may still be taking the exam
-            feedback: isCorrect ? (language === 'ka' ? 'სწორია.' : 'Correct.') : language === 'ka' ? 'არასწორია.' : 'Incorrect.',
-            autoGradedBy: 'mcq_rule',
-          };
-        } else {
-          const g = await gradeQuestionWithAI(config, { question: q, studentAnswer: String(ans ?? ''), language });
-          if (g.needsReview) needsReview = true;
-          totalScore += g.earnedPoints;
-          grading[q.id] = g;
-        }
-      })
-    );
 
     const proctorSummary = buildProctorSummary(test.id, email, attempt.pausesUsed);
     if (late) proctorSummary.flagsRaised.unshift('Submitted after the deadline');
 
-    const percentage = test.totalPoints > 0 ? Math.round((totalScore / test.totalPoints) * 100) : 0;
     const student = store.getStudentByEmail(email);
 
+    // No automatic scoring of any kind: every submission waits for the lecturer.
     const submission: Omit<TestSubmission, 'id'> = {
       testId: test.id,
       testTitle: test.title,
@@ -557,46 +535,44 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
       startedAt: attempt.startedAt,
       submittedAt: attempt.submittedAt,
       answers,
-      grading,
-      questionGradings: grading,
-      totalScore,
+      grading: {},
+      questionGradings: {},
+      totalScore: 0,
       maxScore: test.totalPoints,
-      percentage,
-      passed: percentage >= test.passingScore,
-      // AI grades are provisional until the lecturer confirms them if anything was flagged
-      status: needsReview || late ? 'pending_review' : 'graded',
-      gradedBy: 'auto',
+      percentage: 0,
+      passed: false,
+      status: 'pending_review',
       proctorSummary,
     };
-    return c.json(store.addSubmission(submission));
+    return c.json(forStudent(store.addSubmission(submission)));
   });
 
+  /** The lecturer's grade. Points are clamped per question; unscored questions count as 0. */
   const applyManualGrade = async (c: Context<AppEnv>) => {
     const sub = store.getSubmissionById(c.req.param('id')!);
     if (!sub) return c.json({ error: 'Submission not found' }, 404);
-    const b = await body(c);
-    const grading: Record<string, QuestionGrading> = b?.grading || b?.questionGradings || {};
-    const totalScore = Object.values(grading).reduce((n, g) => n + (Number(g?.earnedPoints) || 0), 0);
     const test = store.getTestById(sub.testId);
-    const cleaned = Object.fromEntries(
-      Object.entries(grading).map(([k, g]) => [k, { ...g, needsReview: false, autoGradedBy: g.autoGradedBy || 'proctor_manual' }])
-    ) as Record<string, QuestionGrading>;
-    return c.json(store.updateSubmissionGrading(sub.id, cleaned, totalScore, test?.passingScore ?? 51));
+    if (!test) return c.json({ error: 'Test not found' }, 404);
+    const b = await body(c);
+    const input: Record<string, Partial<QuestionGrading>> = b?.grading || b?.questionGradings || {};
+    const grading: Record<string, QuestionGrading> = {};
+    for (const q of test.questions) {
+      const g = input[q.id] || {};
+      const points = Math.min(q.points, Math.max(0, Number(g.earnedPoints) || 0));
+      grading[q.id] = {
+        questionId: q.id,
+        earnedPoints: points,
+        maxPoints: q.points,
+        isCorrect: points >= q.points,
+        feedback: String(g.feedback || '').slice(0, 4000),
+        autoGradedBy: 'proctor_manual',
+      };
+    }
+    const totalScore = Object.values(grading).reduce((n, g) => n + g.earnedPoints, 0);
+    return c.json(store.updateSubmissionGrading(sub.id, grading, totalScore, test.passingScore));
   };
   app.post('/api/submissions/:id/manual-grade', requireAdmin, applyManualGrade);
   app.patch('/api/submissions/:id/grade', requireAdmin, applyManualGrade);
-
-  /** Admin: re-run AI grading on a single answer from the grading modal */
-  app.post('/api/ai/grade', requireAdmin, async (c) => {
-    const { question, studentAnswer, language } = await body(c);
-    if (!question?.id) return c.json({ error: 'question is required' }, 400);
-    // Use the stored question (with rubric) if we can find it
-    const stored = store
-      .getTests()
-      .flatMap((t) => t.questions)
-      .find((q) => q.id === question.id && q.prompt === question.prompt);
-    return c.json(await gradeQuestionWithAI(config, { question: stored || question, studentAnswer: String(studentAnswer ?? ''), language }));
-  });
 
   // -------------------------------------------------------------------------
   // Proctoring (admin)
