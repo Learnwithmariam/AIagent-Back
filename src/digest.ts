@@ -60,14 +60,21 @@ export class DigestService {
   async runScheduled() {
     if (!this.config.digest.enabled) return;
     if (this.store.getDigests().some((d) => d.date === this.todayInTz())) return;
-    await this.run().catch((e) => console.error('Scheduled digest failed:', e.message));
+    // Only the daily schedule emails subscribers (and only if DIGEST_EMAIL isn't "false")
+    await this.run(undefined, 'ka', { sendEmail: this.config.digest.emailEnabled }).catch((e) =>
+      console.error('Scheduled digest failed:', e.message)
+    );
   }
 
   /**
    * Builds and sends a digest from news that is NEW since the previous digest. Returns null (and
    * sends nothing) when there's nothing new or nothing relevant — no repeats, no filler.
    */
-  async run(subjectFocus = DEFAULT_FOCUS, language: 'en' | 'ka' = 'ka'): Promise<DailyDigest | null> {
+  async run(
+    subjectFocus = DEFAULT_FOCUS,
+    language: 'en' | 'ka' = 'ka',
+    { sendEmail = false }: { sendEmail?: boolean } = {}
+  ): Promise<DailyDigest | null> {
     if (this.isRunning) throw new Error('Digest generation is already in progress.');
     this.isRunning = true;
     try {
@@ -116,7 +123,10 @@ export class DigestService {
         .map((a) => `• ${a.title} (${a.source})\n  ${a.summary}\n  ${a.url || ''}`)
         .join('\n\n')}`;
 
-      const delivered = await this.mailer.sendMany(subscribed.map((s) => ({ to: s.email, subject, html: emailHtml, text })));
+      // Generating from the dashboard is in-app only: no email unless the caller asks for it
+      const delivered = sendEmail
+        ? await this.mailer.sendMany(subscribed.map((s) => ({ to: s.email, subject, html: emailHtml, text })))
+        : [];
 
       const record = this.store.addDigest({
         date: this.todayInTz(),
@@ -145,6 +155,9 @@ export class DigestService {
       lastRunAt: this.lastRunAt || this.store.getDigests()[0]?.generatedAt || null,
       lastError: this.lastError,
       lastOutcome: this.lastOutcome,
+      emailOnSchedule: this.config.digest.emailEnabled,
+      today: this.todayInTz(),
+      digests: this.store.getDigests().slice(0, 60),
       enabled: this.config.digest.enabled,
       schedule: cronSchedule,
       newsSource: 'rss',

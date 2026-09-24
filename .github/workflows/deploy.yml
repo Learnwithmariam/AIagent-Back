@@ -3,10 +3,11 @@ name: Deploy API to Cloudflare Workers
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 concurrency:
-  group: deploy-api
+  group: deploy-api-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -23,8 +24,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
+      # Pull requests only typecheck; main deploys the "aiagent-back" Worker
       - name: Deploy
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+        if: ${{ github.event_name != 'pull_request' && env.CLOUDFLARE_API_TOKEN != '' }}
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}

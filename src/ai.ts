@@ -25,6 +25,10 @@ interface CompletionOpts {
   maxTokens?: number;
   /** OpenRouter fallback pool; defaults to the chat models */
   models?: string[];
+  /** Gemini 3 thinking depth. 'minimal' answers in a few seconds; deeper levels are slower. */
+  thinking?: 'minimal' | 'low' | 'medium' | 'high';
+  /** Total time budget across all retries and providers, so a request never hangs */
+  budgetMs?: number;
 }
 
 class AIError extends Error {
@@ -36,7 +40,14 @@ class AIError extends Error {
   }
 }
 
-async function callGemini(config: Config, model: string, messages: Msg[], opts: CompletionOpts): Promise<CompletionResult> {
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function callGemini(
+  config: Config,
+  model: string,
+  messages: Msg[],
+  opts: CompletionOpts & { timeoutMs: number; withThinking: boolean }
+): Promise<CompletionResult> {
   const system = messages
     .filter((m) => m.role === 'system')
     .map((m) => m.content)
@@ -61,13 +72,18 @@ async function callGemini(config: Config, model: string, messages: Msg[], opts: 
         temperature: opts.temperature ?? 0.5,
         // Flash models think before answering and that counts toward the output budget, so leave room
         maxOutputTokens: Math.max(2048, (opts.maxTokens ?? 1500) * 2),
+        ...(opts.withThinking && /^gemini-3|latest$/.test(model) ? { thinkingConfig: { thinkingLevel: opts.thinking || 'minimal' } } : {}),
       },
     }),
-    signal: AbortSignal.timeout(45_000),
+    signal: AbortSignal.timeout(opts.timeoutMs),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw new Error(`Gemini ${res.status} for ${model}: ${body.slice(0, 300)}`);
+    // 429 = quota, 5xx = "high demand" / outage: worth retrying shortly. 400/403/404: move on.
+    const retryable = res.status === 429 || res.status >= 500;
+    const err = new AIError(`Gemini ${res.status} for ${model}: ${body.slice(0, 300)}`, retryable);
+    (err as any).thinkingRejected = res.status === 400 && /thinking/i.test(body);
+    throw err;
   }
   const data: any = await res.json();
   const candidate = data?.candidates?.[0];
@@ -76,11 +92,11 @@ async function callGemini(config: Config, model: string, messages: Msg[], opts: 
     .map((p: any) => p.text)
     .join('')
     .trim();
-  if (!text) throw new Error(`Empty reply from Gemini ${model} (finishReason: ${candidate?.finishReason || data?.promptFeedback?.blockReason || 'unknown'})`);
+  if (!text) throw new AIError(`Empty reply from Gemini ${model} (finishReason: ${candidate?.finishReason || data?.promptFeedback?.blockReason || 'unknown'})`, true);
   return { text, model };
 }
 
-async function callOpenRouter(config: Config, model: string, messages: Msg[], opts: CompletionOpts): Promise<CompletionResult> {
+async function callOpenRouter(config: Config, model: string, messages: Msg[], opts: CompletionOpts & { timeoutMs: number }): Promise<CompletionResult> {
   const res = await fetch(OPENROUTER_URL, {
     method: 'POST',
     headers: {
@@ -96,7 +112,7 @@ async function callOpenRouter(config: Config, model: string, messages: Msg[], op
       temperature: opts.temperature ?? 0.5,
       max_tokens: opts.maxTokens ?? 1500,
     }),
-    signal: AbortSignal.timeout(60_000),
+    signal: AbortSignal.timeout(opts.timeoutMs),
   });
 
   if (!res.ok) {
@@ -115,28 +131,82 @@ async function callOpenRouter(config: Config, model: string, messages: Msg[], op
   return { text, model: data.model || model };
 }
 
-/** Gemini models first, then the OpenRouter pool. Failures are logged, never shown to the student. */
+// Free OpenRouter models come and go (ids that were free get moved to paid-only and return 404),
+// so the fallback pool comes from OpenRouter's live catalogue, refreshed every few hours.
+let freeCatalog: { ids: string[]; fetchedAt: number } | null = null;
+
+async function openRouterPool(config: Config, preferred: string[]): Promise<string[]> {
+  if (!freeCatalog || Date.now() - freeCatalog.fetchedAt > 6 * 3600_000) {
+    try {
+      const res = await fetch('https://openrouter.ai/api/v1/models', { signal: AbortSignal.timeout(5_000) });
+      const data: any = await res.json();
+      const ids = (Array.isArray(data?.data) ? data.data : [])
+        .filter((m: any) => typeof m?.id === 'string' && m.id.endsWith(':free') && Number(m?.context_length) >= 16_000)
+        // newest first: recent free models are the ones still being served
+        .sort((a: any, b: any) => (Number(b.created) || 0) - (Number(a.created) || 0))
+        .map((m: any) => m.id as string);
+      if (ids.length) freeCatalog = { ids, fetchedAt: Date.now() };
+    } catch (err) {
+      console.warn('OpenRouter catalogue unavailable:', String((err as Error)?.message || err));
+    }
+  }
+  if (!freeCatalog) return preferred;
+  const live = new Set(freeCatalog.ids);
+  // configured models that are still free, then other free models from the catalogue
+  return [...new Set([...preferred.filter((m) => live.has(m)), ...freeCatalog.ids])].slice(0, 6);
+}
+
+/**
+ * Gemini models first (each retried with a short backoff when Google is overloaded), then the
+ * OpenRouter pool. Everything runs inside one time budget. Failures are logged, never shown
+ * to the student.
+ */
 async function complete(config: Config, messages: Msg[], opts: CompletionOpts = {}): Promise<CompletionResult> {
+  const deadline = Date.now() + (opts.budgetMs ?? 45_000);
+  const left = () => deadline - Date.now();
   let lastError: unknown;
+  const note = (err: unknown) => {
+    lastError = err;
+    console.warn(String((err as Error)?.message || err));
+  };
 
   if (config.gemini.apiKey) {
-    for (const model of config.gemini.models) {
-      try {
-        return await callGemini(config, model, messages, opts);
-      } catch (err) {
-        lastError = err;
-        console.warn(String((err as Error)?.message || err));
+    // Pass 1 tries every Gemini model once, pass 2 retries the overloaded ones after a pause:
+    // a 503 "high demand" usually clears within a couple of seconds.
+    let queue = [...config.gemini.models];
+    const noThinking = new Set<string>();
+    for (let pass = 1; pass <= 2 && queue.length; pass++) {
+      if (pass === 2) {
+        if (left() < 8_000) break;
+        await sleep(1_200);
       }
+      const retry: string[] = [];
+      for (const model of queue) {
+        if (left() < 4_000) break;
+        try {
+          return await callGemini(config, model, messages, {
+            ...opts,
+            withThinking: !noThinking.has(model),
+            timeoutMs: Math.min(25_000, left() - 2_000),
+          });
+        } catch (err: any) {
+          note(err);
+          if (err?.thinkingRejected) noThinking.add(model);
+          // retry overloads and timeouts; skip models that are gone or refuse the request
+          if (err?.thinkingRejected || !(err instanceof AIError) || err.retryable) retry.push(model);
+        }
+      }
+      queue = retry;
     }
   }
 
-  if (config.openrouter.apiKey) {
-    for (const model of opts.models || config.openrouter.chatModels) {
+  if (config.openrouter.apiKey && left() > 4_000) {
+    for (const model of await openRouterPool(config, opts.models || config.openrouter.chatModels)) {
+      if (left() < 4_000) break;
       try {
-        return await callOpenRouter(config, model, messages, opts);
+        return await callOpenRouter(config, model, messages, { ...opts, timeoutMs: Math.min(30_000, left() - 1_000) });
       } catch (err) {
-        lastError = err;
-        console.warn(String((err as Error)?.message || err));
+        note(err);
         if (err instanceof AIError && !err.retryable) break;
       }
     }
@@ -282,7 +352,7 @@ ${context || '(no materials uploaded yet)'}`;
     { role: 'user', content: message.slice(0, 4000) },
   ];
 
-  const result = await complete(config, messages, { temperature: 0.5, maxTokens: 700 });
+  const result = await complete(config, messages, { temperature: 0.5, maxTokens: 700, thinking: 'minimal', budgetMs: 45_000 });
   console.log(`chat answered by ${result.model}`);
   const reply = result.text.replace(/<think>[\s\S]*?<\/think>/g, '').trim() || (isKa ? 'პასუხის გენერირება ვერ მოხერხდა.' : 'Could not generate a reply.');
 
@@ -349,6 +419,8 @@ Return ONLY a JSON object (no markdown):
     models: freeModels,
     temperature: 0.4,
     maxTokens: 2500,
+    thinking: 'low',
+    budgetMs: 90_000,
   });
 
   const parsed = parseJsonLoose<{

@@ -27,6 +27,7 @@ export interface Env {
   DIGEST_FEEDS?: string;
   MAIL_FROM?: string;
   DIGEST_ENABLED?: string;
+  DIGEST_EMAIL?: string;
   DIGEST_TIMEZONE?: string;
   EXAM_MAX_PAUSES?: string;
   EXAM_SUBMIT_GRACE_SECONDS?: string;
@@ -51,7 +52,7 @@ export const DEFAULT_FREE_MODELS = [
  * Gemini models tried in order before falling back to OpenRouter. gemini-1.5-flash has been
  * retired by Google (404), so the default is its current Flash successor. Override with GEMINI_MODELS.
  */
-export const DEFAULT_GEMINI_MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash'];
+export const DEFAULT_GEMINI_MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-flash-lite-latest'];
 
 const list = (v: string | undefined) =>
   (v || '')
@@ -109,6 +110,8 @@ export function buildConfig(env: Env) {
 
     digest: {
       enabled: env.DIGEST_ENABLED !== 'false',
+      /** Whether the daily 08:00 run emails subscribers. Generating from the dashboard never emails. */
+      emailEnabled: env.DIGEST_EMAIL !== 'false',
       /** Free public RSS/Atom feeds the digest reads news from */
       feeds: list(env.DIGEST_FEEDS).length ? list(env.DIGEST_FEEDS) : DEFAULT_FEEDS,
       timezone: env.DIGEST_TIMEZONE || 'Asia/Tbilisi',

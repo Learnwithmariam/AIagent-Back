@@ -649,7 +649,7 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   app.get('/api/cron/digests', requireAuth, (c) => {
     const digests = store.getDigests().slice(0, 60);
     if (c.get('user').role === 'admin') return c.json(digests);
-    return c.json(digests.map(({ recipients, ...d }) => ({ ...d, recipients: [] })));
+    return c.json(digests.map(({ recipients, emailHtml, ...d }) => ({ ...d, recipients: [], emailHtml: '' })));
   });
 
   app.post('/api/cron/trigger', requireAdmin, async (c) => {
