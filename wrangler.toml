@@ -1,6 +1,6 @@
 # G.K. BTU Students — API Worker
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
-name = "gk-btu-students-api"
+name = "aiagent-back"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
 workers_dev = true
@@ -25,8 +25,8 @@ enabled = true
 ENVIRONMENT = "production"
 # Comma-separated frontend origins allowed by CORS. Replace <subdomain> with your account's
 # workers.dev subdomain (shown by `wrangler deploy` in the frontend repo), or use a custom domain.
-FRONTEND_URL = "https://gk-btu-students.<subdomain>.workers.dev"
-PUBLIC_APP_URL = "https://gk-btu-students.<subdomain>.workers.dev"
+FRONTEND_URL = "https://aiagent-front.giorgi-khatiashvili-9e4.workers.dev"
+PUBLIC_APP_URL = "https://aiagent-front.giorgi-khatiashvili-9e4.workers.dev"
 JWT_EXPIRES_IN = "12h"
 ADMIN_EMAIL = "giorgi.khatiashvili@btu.edu.ge"
 ADMIN_NAME = "Prof. Giorgi Khatiashvili"

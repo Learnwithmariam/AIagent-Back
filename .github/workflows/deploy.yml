@@ -40,8 +40,8 @@ jobs:
             exit 1
           fi
           echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
-          echo "FRONTEND=https://gk-btu-students.$SUB.workers.dev" >> "$GITHUB_ENV"
-          echo "API=https://gk-btu-students-api.$SUB.workers.dev" >> "$GITHUB_ENV"
+          echo "FRONTEND=https://aiagent-front.$SUB.workers.dev" >> "$GITHUB_ENV"
+          echo "API=https://aiagent-back.$SUB.workers.dev" >> "$GITHUB_ENV"
 
       - name: Deploy Worker (linked to the frontend URL)
         if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
