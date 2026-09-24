@@ -1,69 +1,112 @@
-import 'dotenv/config';
+import { DEFAULT_FEEDS } from './news';
 
-function required(name: string): string {
-  const v = process.env[name];
-  if (!v) {
-    throw new Error(`Missing required environment variable: ${name} (see .env.example)`);
-  }
-  return v;
+/**
+ * Runtime configuration, built from the Worker's bindings.
+ * Plain values live in wrangler.toml [vars]; secrets are set with `wrangler secret put <NAME>`.
+ */
+export interface Env {
+  HUB: DurableObjectNamespace<import('./hub').CourseHub>;
+
+  // secrets
+  JWT_SECRET?: string;
+  ADMIN_PASSWORD?: string;
+  OPENROUTER_API_KEY?: string;
+  RESEND_API_KEY?: string;
+
+  // vars
+  ENVIRONMENT?: string;
+  FRONTEND_URL?: string;
+  PUBLIC_APP_URL?: string;
+  JWT_EXPIRES_IN?: string;
+  ADMIN_EMAIL?: string;
+  ADMIN_NAME?: string;
+  OPENROUTER_MODELS?: string;
+  OPENROUTER_DIGEST_MODEL?: string;
+  DIGEST_FEEDS?: string;
+  MAIL_FROM?: string;
+  DIGEST_ENABLED?: string;
+  DIGEST_TIMEZONE?: string;
+  EXAM_MAX_PAUSES?: string;
+  EXAM_SUBMIT_GRACE_SECONDS?: string;
 }
 
-const isProd = process.env.NODE_ENV === 'production';
+export const APP_NAME = 'G.K. BTU Students';
 
-export const config = {
-  isProd,
-  port: Number(process.env.PORT) || 4000,
+/**
+ * Free OpenRouter models tried in order when OPENROUTER_MODELS isn't set.
+ * The free catalogue changes often — check https://openrouter.ai/models?max_price=0
+ * and override the list in wrangler.toml instead of editing code.
+ */
+export const DEFAULT_FREE_MODELS = [
+  'meta-llama/llama-3.3-70b-instruct:free',
+  'deepseek/deepseek-chat-v3-0324:free',
+  'google/gemma-3-27b-it:free',
+  'mistralai/mistral-small-3.2-24b-instruct:free',
+  'qwen/qwen3-235b-a22b:free',
+];
 
-  /** Comma-separated list of allowed frontend origins, e.g. https://cognitest.vercel.app */
-  frontendOrigins: (process.env.FRONTEND_URL || 'http://localhost:5173')
+const list = (v: string | undefined) =>
+  (v || '')
     .split(',')
     .map((s) => s.trim())
-    .filter(Boolean),
+    .filter(Boolean);
 
-  /** Secret used to sign login tokens. Long random string in production. */
-  jwtSecret: isProd ? required('JWT_SECRET') : process.env.JWT_SECRET || 'dev-only-insecure-secret-change-me',
-  jwtExpiresIn: process.env.JWT_EXPIRES_IN || '12h',
-
-  /** Bootstrap admin — created on first start only if no admin exists. */
-  adminEmail: (process.env.ADMIN_EMAIL || '').trim().toLowerCase(),
-  adminName: process.env.ADMIN_NAME || 'Prof. Giorgi Khatiashvili',
-  adminPassword: process.env.ADMIN_PASSWORD || '',
-
-  dataDir: process.env.DATA_DIR || './data',
-
-  gemini: {
-    apiKey: process.env.GEMINI_API_KEY || '',
-    /** Chat + grading model. Check https://ai.google.dev/gemini-api/docs/models for current IDs. */
-    model: process.env.GEMINI_MODEL || 'gemini-3.6-flash',
-    /** Digest model (needs Google Search grounding support). */
-    digestModel: process.env.GEMINI_DIGEST_MODEL || process.env.GEMINI_MODEL || 'gemini-3.6-flash',
-  },
-
-  smtp: {
-    host: process.env.SMTP_HOST || '',
-    port: Number(process.env.SMTP_PORT) || 587,
-    user: process.env.SMTP_USER || '',
-    pass: process.env.SMTP_PASS || '',
-    from: process.env.SMTP_FROM || 'CogniTest <noreply@btu.edu.ge>',
-  },
-
-  digest: {
-    /** cron expression, evaluated in DIGEST_TIMEZONE */
-    cron: process.env.DIGEST_CRON || '0 8 * * *',
-    timezone: process.env.DIGEST_TIMEZONE || 'Asia/Tbilisi',
-    enabled: process.env.DIGEST_ENABLED !== 'false',
-  },
-
-  exam: {
-    /** Max pauses per attempt. 0 disables pausing entirely (recommended for high-stakes exams). */
-    maxPauses: Number(process.env.EXAM_MAX_PAUSES ?? 3),
-    /** Seconds of network grace after the deadline before a submission is rejected. */
-    submitGraceSeconds: Number(process.env.EXAM_SUBMIT_GRACE_SECONDS ?? 60),
-  },
-
-  publicAppUrl: process.env.PUBLIC_APP_URL || 'http://localhost:5173',
-};
-
-if (!config.gemini.apiKey) {
-  console.warn('⚠️  GEMINI_API_KEY is not set — AI chat, AI grading and the digest will not work.');
+/** "12h" / "30m" / "7d" / "3600" → seconds */
+function parseDuration(v: string | undefined, fallback: number): number {
+  const m = /^(\d+)\s*([smhd]?)$/.exec((v || '').trim());
+  if (!m) return fallback;
+  const mult = { '': 1, s: 1, m: 60, h: 3600, d: 86400 }[m[2] as '' | 's' | 'm' | 'h' | 'd'];
+  return Number(m[1]) * mult;
 }
+
+export function buildConfig(env: Env) {
+  const isProd = env.ENVIRONMENT === 'production';
+  if (isProd && !env.JWT_SECRET) {
+    throw new Error('Missing required secret JWT_SECRET (wrangler secret put JWT_SECRET)');
+  }
+  const models = list(env.OPENROUTER_MODELS);
+  const chatModels = models.length ? models : DEFAULT_FREE_MODELS;
+
+  return {
+    isProd,
+    frontendOrigins: list(env.FRONTEND_URL || 'http://localhost:5173'),
+    publicAppUrl: env.PUBLIC_APP_URL || 'http://localhost:5173',
+
+    jwtSecret: env.JWT_SECRET || 'dev-only-insecure-secret-change-me',
+    jwtExpiresInSeconds: parseDuration(env.JWT_EXPIRES_IN, 12 * 3600),
+
+    /** Bootstrap admin — created on first start only if no admin exists. */
+    adminEmail: (env.ADMIN_EMAIL || '').trim().toLowerCase(),
+    adminName: env.ADMIN_NAME || 'Prof. Giorgi Khatiashvili',
+    adminPassword: env.ADMIN_PASSWORD || '',
+
+    openrouter: {
+      apiKey: env.OPENROUTER_API_KEY || '',
+      /** Models students may pick in the chat; the first is the default. Fallbacks follow the same order. */
+      chatModels,
+      /** The digest only ever uses free (":free") models, so it never costs anything. */
+      digestModels: [...new Set([env.OPENROUTER_DIGEST_MODEL, ...chatModels].filter((m): m is string => Boolean(m?.endsWith(':free'))))],
+    },
+
+    mail: {
+      resendApiKey: env.RESEND_API_KEY || '',
+      from: env.MAIL_FROM || `${APP_NAME} <noreply@example.com>`,
+    },
+
+    digest: {
+      enabled: env.DIGEST_ENABLED !== 'false',
+      /** Free public RSS/Atom feeds the digest reads news from */
+      feeds: list(env.DIGEST_FEEDS).length ? list(env.DIGEST_FEEDS) : DEFAULT_FEEDS,
+      timezone: env.DIGEST_TIMEZONE || 'Asia/Tbilisi',
+    },
+
+    exam: {
+      /** Max pauses per attempt. 0 disables pausing entirely (recommended for high-stakes exams). */
+      maxPauses: Number(env.EXAM_MAX_PAUSES ?? 3),
+      /** Seconds of network grace after the deadline before a submission is flagged late. */
+      submitGraceSeconds: Number(env.EXAM_SUBMIT_GRACE_SECONDS ?? 60),
+    },
+  };
+}
+
+export type Config = ReturnType<typeof buildConfig>;
