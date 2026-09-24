@@ -1,8 +1,12 @@
 name: Deploy API to Cloudflare Workers
 
+# Runs on GitHub's servers — no local terminal needed.
+# Required repository secret: CLOUDFLARE_API_TOKEN
+# Optional repository secrets (pushed to the Worker as encrypted secrets when present):
+#   OPENROUTER_API_KEY, RESEND_API_KEY, ADMIN_PASSWORD, JWT_SECRET
 on:
   push:
-    branches: [main]
+    branches: [main, claude/exciting-gauss-v4myn9]
   workflow_dispatch:
 
 concurrency:
@@ -13,7 +17,6 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      # job-level so the deploy step can be skipped until the secret exists
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
       - uses: actions/checkout@v4
@@ -23,10 +26,56 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
-      - name: Deploy
+
+      - name: Resolve Cloudflare account and workers.dev subdomain
         if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy
+        run: |
+          set -euo pipefail
+          api() { curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4$1"; }
+          ACCOUNT_ID="${{ secrets.CLOUDFLARE_ACCOUNT_ID }}"
+          if [ -z "$ACCOUNT_ID" ]; then ACCOUNT_ID=$(api /accounts | jq -r '.result[0].id'); fi
+          SUB=$(api "/accounts/$ACCOUNT_ID/workers/subdomain" | jq -r '.result.subdomain // empty')
+          if [ -z "$SUB" ]; then
+            echo "::error::This account has no workers.dev subdomain yet. Open Cloudflare dashboard → Workers & Pages once to create it, then re-run."
+            exit 1
+          fi
+          echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
+          echo "FRONTEND=https://gk-btu-students.$SUB.workers.dev" >> "$GITHUB_ENV"
+          echo "API=https://gk-btu-students-api.$SUB.workers.dev" >> "$GITHUB_ENV"
+
+      - name: Deploy Worker (linked to the frontend URL)
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+        run: npx wrangler deploy --var "FRONTEND_URL:$FRONTEND" --var "PUBLIC_APP_URL:$FRONTEND"
+
+      - name: Set Worker secrets
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          set -euo pipefail
+          # JWT_SECRET is required in production. Generate one on the first deploy only —
+          # regenerating it on every run would sign everyone out.
+          if [ -z "$JWT_SECRET" ] && ! npx wrangler secret list | grep -q '"JWT_SECRET"'; then
+            JWT_SECRET=$(openssl rand -hex 48)
+          fi
+          # Only secrets that exist in the repo are sent; values never appear in the log.
+          jq -n --arg a "$OPENROUTER_API_KEY" --arg b "$RESEND_API_KEY" --arg c "$ADMIN_PASSWORD" --arg d "$JWT_SECRET" \
+            '{OPENROUTER_API_KEY:$a, RESEND_API_KEY:$b, ADMIN_PASSWORD:$c, JWT_SECRET:$d} | with_entries(select(.value != ""))' > secrets.json
+          if [ "$(jq 'length' secrets.json)" -gt 0 ]; then npx wrangler secret bulk secrets.json; fi
+          rm -f secrets.json
+
+      - name: Health check
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+        run: |
+          for i in 1 2 3 4 5 6; do curl -fsS "$API/api/health" && exit 0; sleep 5; done
+          echo "::error::API did not answer at $API/api/health"; exit 1
+
+      - name: Summary
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+        run: |
+          echo "### Deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "- API: $API" >> "$GITHUB_STEP_SUMMARY"
+          echo "- App (frontend): $FRONTEND" >> "$GITHUB_STEP_SUMMARY"
