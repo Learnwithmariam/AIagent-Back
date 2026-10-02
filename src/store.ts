@@ -9,6 +9,7 @@ import {
   type UserAccount,
   type ExamAttempt,
   type ActiveExamSession,
+  type OtpRecord,
 } from './types';
 import type { Config } from './config';
 import { hashPassword, randomHex } from './auth';
@@ -57,6 +58,14 @@ export class Store {
       PRIMARY KEY (coll, id))`);
     sql.exec(`CREATE INDEX IF NOT EXISTS records_seq ON records (coll, seq)`);
     sql.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+    // One pending sign-in code per email. Only a hash of the code is stored, never the code itself.
+    sql.exec(`CREATE TABLE IF NOT EXISTS otp_codes (
+      email TEXT PRIMARY KEY,
+      code_hash TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,   -- ms since epoch
+      attempts INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL    -- ms since epoch, also used for the resend cooldown
+    )`);
     this.load();
   }
 
@@ -257,19 +266,14 @@ export class Store {
     return this.data.students.find((s) => s.email.toLowerCase() === e);
   }
 
-  /** Creates the Student profile + login account with the given temporary password. */
-  async addStudent(
-    input: { name: string; email: string; department: string },
-    tempPassword: string
-  ): Promise<{ student: Student; created: boolean }> {
+  /**
+   * Creates the Student profile + login account. Students sign in with emailed one-time codes,
+   * so there is no password: the account only needs the email.
+   */
+  addStudent(input: { name: string; email: string; department: string }): { student: Student; created: boolean } {
     const email = input.email.trim().toLowerCase();
     const existing = this.getStudentByEmail(email);
     if (existing) return { student: existing, created: false };
-
-    const passwordHash = await hashPassword(tempPassword);
-    // re-check after the await: another request may have created it meanwhile
-    const raced = this.getStudentByEmail(email);
-    if (raced) return { student: raced, created: false };
 
     const student: Student = {
       id: newId('std'),
@@ -288,8 +292,7 @@ export class Store {
         email,
         name: student.name,
         role: 'student',
-        passwordHash,
-        isTemporaryPassword: true,
+        isTemporaryPassword: false,
         createdAt: new Date().toISOString(),
         department: student.department,
       });
@@ -338,6 +341,7 @@ export class Store {
       }
       // live sessions are keyed by email; the student simply rejoins under the new one
       this.remove('sessions', (x) => x.studentEmail === oldEmail);
+      this.deleteOtp(oldEmail);
     } else if (updates.name !== undefined) {
       for (const s of this.data.submissions.filter((x) => x.studentEmail.toLowerCase() === oldEmail)) {
         s.studentName = student.name;
@@ -349,6 +353,7 @@ export class Store {
 
   deleteStudent(email: string): boolean {
     const e = email.toLowerCase();
+    this.deleteOtp(e);
     const removed = this.remove('students', (s) => s.email.toLowerCase() === e);
     this.remove('users', (u) => u.role === 'student' && u.email.toLowerCase() === e);
     return removed > 0;
@@ -523,6 +528,41 @@ export class Store {
   pruneSessions(maxAgeMs = 24 * 3600_000) {
     const cutoff = Date.now() - maxAgeMs;
     this.remove('sessions', (s) => new Date(s.lastHeartbeat).getTime() < cutoff);
+  }
+
+  // ---------- One-time sign-in codes ----------
+  getOtp(email: string): OtpRecord | undefined {
+    const row = this.sql
+      .exec<{ email: string; code_hash: string; expires_at: number; attempts: number; created_at: number }>(
+        `SELECT * FROM otp_codes WHERE email = ?`,
+        email.toLowerCase()
+      )
+      .toArray()[0];
+    return row && { email: row.email, codeHash: row.code_hash, expiresAt: row.expires_at, attempts: row.attempts, createdAt: row.created_at };
+  }
+
+  /** Replaces any earlier code for this email, so only the newest one works. */
+  putOtp(email: string, codeHash: string, ttlMs: number) {
+    const now = Date.now();
+    this.sql.exec(
+      `INSERT OR REPLACE INTO otp_codes (email, code_hash, expires_at, attempts, created_at) VALUES (?, ?, ?, 0, ?)`,
+      email.toLowerCase(),
+      codeHash,
+      now + ttlMs,
+      now
+    );
+    // housekeeping: drop codes that expired more than a day ago
+    this.sql.exec(`DELETE FROM otp_codes WHERE expires_at < ?`, now - 86_400_000);
+  }
+
+  /** Counts a wrong guess; returns the new attempt count. */
+  bumpOtpAttempts(email: string): number {
+    this.sql.exec(`UPDATE otp_codes SET attempts = attempts + 1 WHERE email = ?`, email.toLowerCase());
+    return this.getOtp(email)?.attempts ?? 0;
+  }
+
+  deleteOtp(email: string) {
+    this.sql.exec(`DELETE FROM otp_codes WHERE email = ?`, email.toLowerCase());
   }
 
   // ---------- Digests ----------

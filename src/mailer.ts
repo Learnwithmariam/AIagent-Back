@@ -86,25 +86,47 @@ export class Mailer {
     return delivered;
   }
 
-  /** The temporary password is included in the email body only — never logged or stored. */
-  async sendWelcome({ to, name, temporaryPassword }: { to: string; name: string; temporaryPassword: string }) {
-    const url = this.config.publicAppUrl;
-    const subject = `${APP_NAME} — თქვენი ანგარიში შეიქმნა`;
-    const html = `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;padding:0;border:1px solid #f1d5e6;border-radius:16px;overflow:hidden">
+  /** Shared BTU-branded layout for account emails. */
+  private layout(body: string): string {
+    return `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;padding:0;border:1px solid #f1d5e6;border-radius:16px;overflow:hidden">
   <div style="background:linear-gradient(135deg,#E20074,#9b0052);padding:22px 24px;color:#fff">
     <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;opacity:.85">BTU</div>
     <div style="font-size:20px;font-weight:bold">${APP_NAME}</div>
   </div>
-  <div style="padding:24px;color:#1a0f16">
-  <p>გამარჯობა <b>${escapeHtml(name)}</b>,</p>
-  <p>კურსის „ინოვაციური მეწარმეობა და სტარტაპები“ პლატფორმაზე თქვენთვის შეიქმნა ანგარიში.</p>
-  <p>ელ-ფოსტა: <b>${escapeHtml(to)}</b><br>დროებითი პაროლი: <b style="font-family:monospace;font-size:16px">${escapeHtml(temporaryPassword)}</b></p>
-  <p><a href="${escapeHtml(url)}" style="display:inline-block;background:#E20074;color:#fff;text-decoration:none;padding:10px 18px;border-radius:10px;font-weight:bold">შესვლა</a></p>
-  <p style="color:#b45309">პირველი შესვლისას სისტემა მოგთხოვთ პაროლის შეცვლას.</p>
-  </div>
+  <div style="padding:24px;color:#1a0f16">${body}</div>
 </div>`;
-    const text = `გამარჯობა ${name},\n${APP_NAME}-ზე შეიქმნა ანგარიში.\nელ-ფოსტა: ${to}\nდროებითი პაროლი: ${temporaryPassword}\nშესვლა: ${url}\nპირველი შესვლისას შეცვალეთ პაროლი.`;
+  }
+
+  /** The code appears only in the email body: it is never logged or stored in plain text. */
+  async sendOtp({ to, name, code, minutes }: { to: string; name: string; code: string; minutes: number }) {
+    // the code stays out of the subject, which ends up in the audit log and mail previews
+    const subject = `${APP_NAME} — შესვლის კოდი`;
+    const html = this.layout(`
+  <p>გამარჯობა <b>${escapeHtml(name)}</b>,</p>
+  <p>პლატფორმაზე შესასვლელად შეიყვანეთ ეს კოდი:</p>
+  <div style="font-family:monospace;font-size:34px;font-weight:bold;letter-spacing:10px;text-align:center;background:#fdf4f9;border:1px dashed #E20074;border-radius:12px;padding:16px 0;margin:18px 0;color:#9b0052">${escapeHtml(code)}</div>
+  <p style="color:#5b4a54">კოდი მოქმედებს <b>${minutes} წუთის</b> განმავლობაში და მხოლოდ ერთხელ.</p>
+  <p style="font-size:12px;color:#9a8a93">თუ კოდი თქვენ არ მოგითხოვიათ, უბრალოდ უგულებელყავით ეს წერილი — ანგარიშზე წვდომა მის გარეშე შეუძლებელია. ეს კოდი არავის გაუზიაროთ.</p>`);
+    const text = `გამარჯობა ${name},\n\n${APP_NAME}-ზე შესვლის კოდი: ${code}\nმოქმედებს ${minutes} წუთი, მხოლოდ ერთხელ.\n\nთუ კოდი არ მოგითხოვიათ, უგულებელყავით ეს წერილი.`;
     return this.send(to, subject, html, text);
+  }
+
+  /** Invitations for newly added students, sent in Resend batches. Returns the delivered addresses. */
+  async sendInvites(invites: { to: string; name: string }[]): Promise<string[]> {
+    const url = this.config.publicAppUrl;
+    const subject = `${APP_NAME} — მოწვევა კურსზე`;
+    return this.sendMany(
+      invites.map(({ to, name }) => ({
+        to,
+        subject,
+        html: this.layout(`
+  <p>გამარჯობა <b>${escapeHtml(name)}</b>,</p>
+  <p>ლექტორმა დაგამატათ კურსის „მეწარმეობა და ინოვაციები“ პლატფორმაზე.</p>
+  <p>პაროლი არ გჭირდებათ: შესვლის გვერდზე შეიყვანეთ თქვენი ელ-ფოსტა (<b>${escapeHtml(to)}</b>) და ჩვენ გამოგიგზავნით 6-ციფრიან კოდს.</p>
+  <p><a href="${escapeHtml(url)}" style="display:inline-block;background:#E20074;color:#fff;text-decoration:none;padding:10px 18px;border-radius:10px;font-weight:bold">შესვლა</a></p>`),
+        text: `გამარჯობა ${name},\nლექტორმა დაგამატათ ${APP_NAME}-ზე.\nპაროლი არ გჭირდებათ: ${url} — შეიყვანეთ ელ-ფოსტა (${to}) და მიიღებთ 6-ციფრიან კოდს.`,
+      }))
+    );
   }
 
   getAuditLogs(): EmailAuditLog[] {

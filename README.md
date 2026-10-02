@@ -37,10 +37,10 @@ Set the secrets once. They are stored encrypted in Cloudflare, never in git:
 
 ```bash
 npx wrangler secret put JWT_SECRET          # node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
-npx wrangler secret put ADMIN_PASSWORD      # lecturer's first password
+npx wrangler secret put ADMIN_PASSWORD      # lecturer's emergency password (students have none)
 npx wrangler secret put GEMINI_API_KEY      # https://aistudio.google.com/apikey (primary AI)
 npx wrangler secret put OPENROUTER_API_KEY  # https://openrouter.ai/keys (fallback AI)
-npx wrangler secret put RESEND_API_KEY      # optional, https://resend.com/api-keys
+npx wrangler secret put RESEND_API_KEY      # https://resend.com/api-keys (sign-in codes and invites)
 ```
 
 Then edit `[vars]` in `wrangler.toml`: `ADMIN_EMAIL`, `FRONTEND_URL` (your Pages URL), `PUBLIC_APP_URL` and `MAIL_FROM`. Deploy:
@@ -49,7 +49,23 @@ Then edit `[vars]` in `wrangler.toml`: `ADMIN_EMAIL`, `FRONTEND_URL` (your Pages
 npm run deploy
 ```
 
-The admin account is created on first start from `ADMIN_EMAIL` + `ADMIN_PASSWORD`. After that, change the password in the app.
+The admin account is created on first start from `ADMIN_EMAIL` + `ADMIN_PASSWORD`.
+
+### Sign-in (passwordless)
+
+Everyone signs in with a one-time code:
+
+1. The user enters their email. `POST /api/auth/otp/request` creates a 6-digit code and emails it through Resend.
+2. The user types the code. `POST /api/auth/otp/verify` checks it and returns a session token.
+
+- **Codes:** each code is valid for 10 minutes and works only once. A new request replaces the previous code, and a code can be re-sent after 60 seconds.
+- **Wrong guesses:** after 5 wrong tries the code is deleted. Requests and verifications are also rate-limited per IP and email.
+- **Storage:** codes live in the Durable Object's SQLite table `otp_codes` (`email`, `code_hash`, `expires_at`, `attempts`, `created_at`). Only an HMAC-SHA256 of the code is stored, keyed with `JWT_SECRET`.
+- **Unknown emails:** they get the same answer as registered ones, so the form doesn't reveal who is enrolled.
+
+Students have no passwords. The lecturer can still use `POST /api/auth/login` with a password as an emergency route.
+
+**Resend must be able to reach students.** Resend's test sender (`onboarding@resend.dev`) only delivers to the Resend account owner. Verify a domain at resend.com/domains and set `MAIL_FROM` to an address on it. Until then, the lecturer can issue a code from the dashboard (🔑 next to each student) and pass it on.
 
 ### Local development
 
@@ -75,7 +91,7 @@ npm run dev                      # http://localhost:8787
 | `DIGEST_EMAIL` | var | `"false"` keeps the daily 08:00 digest in-app only. Generating a digest from the dashboard never sends email |
 | `OPENROUTER_DIGEST_MODEL` | var | Optional. The digest only ever uses `:free` models, whatever is configured |
 | `DIGEST_FEEDS` | var | Comma-separated RSS/Atom feeds for the digest. Empty = TechCrunch Startups, Crunchbase News, Sifted, EU-Startups, VentureBeat |
-| `RESEND_API_KEY`, `MAIL_FROM` | secret / var | Email. Without it, temporary passwords are shown once to the lecturer |
+| `RESEND_API_KEY`, `MAIL_FROM` | secret / var | Email for sign-in codes, invites and the digest. `MAIL_FROM` must be on a domain verified in Resend |
 | `FRONTEND_URL` | var | Allowed CORS origins, comma-separated |
 | `EXAM_MAX_PAUSES` | var | Pause credits per attempt; `0` disables pausing |
 
@@ -107,12 +123,17 @@ Every `/api/*` route needs `Authorization: Bearer <token>` except `/api/health` 
 - `POST /api/agent/chat`: routing is server-side only; a client-sent `model` is ignored.
 - `PATCH /api/students/:email` (lecturer): edit a student's name, email, department or digest subscription. An email change also moves their login and records.
 - `POST /api/cron/trigger` returns `digest: null` when there is nothing new.
+- `POST /api/auth/otp/request` `{ email }` and `POST /api/auth/otp/verify` `{ email, code }`: passwordless sign-in.
+- `POST /api/students/invite` (lecturer) `{ emails }`: a string separated by commas, semicolons, spaces or new lines, or an array. Creates all the accounts at once (names come from the email), then sends the invites in Resend batches. Returns per-email results.
+- `POST /api/students/:email/login-code` (lecturer): issues a fresh code for a student and returns it to the lecturer if it couldn't be emailed.
+- `POST /api/auth/login` is now for the lecturer only. `POST /api/students/:email/reset-password` has been removed.
 - `POST /api/ai/grade` has been **removed**. Grading goes only through `PATCH /api/submissions/:id/grade` (lecturer), which caps points at each question's maximum.
 - `WS /ws/proctor?token=<jwt>`: live proctoring.
 
 ## Security notes
 
-- Passwords are hashed with PBKDF2-SHA256 (100k iterations, the Workers maximum). Temporary passwords appear only in the email.
+- Sign-in codes are stored only as HMAC-SHA256 hashes, expire after 10 minutes, work once, and allow 5 tries. The code appears only in the email body, never in the subject or logs.
+- The lecturer's emergency password is hashed with PBKDF2-SHA256 (100k iterations, the Workers maximum).
 - Students never receive `correctAnswer` or `rubric`.
 - Proctoring summaries are computed from server-side events. The browser isn't trusted.
 - No automatic or AI grading. Until the lecturer grades a submission, the API returns it to the student without points, pass/fail or feedback.

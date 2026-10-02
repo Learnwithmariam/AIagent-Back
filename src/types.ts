@@ -8,7 +8,7 @@ export interface UserAccount {
   email: string;
   name: string;
   role: Role;
-  /** scrypt hash — never sent to the client */
+  /** Only the lecturer has a password (emergency sign-in). Students sign in with emailed codes. */
   passwordHash?: string;
   /** @deprecated legacy plaintext field, migrated to passwordHash on load */
   temporaryPassword?: string;
@@ -16,6 +16,15 @@ export interface UserAccount {
   createdAt?: string;
   lastLoginAt?: string;
   department?: string;
+}
+
+/** A pending sign-in code (table otp_codes). Only a hash of the 6-digit code is stored. */
+export interface OtpRecord {
+  email: string;
+  codeHash: string;
+  expiresAt: number;
+  attempts: number;
+  createdAt: number;
 }
 
 export interface AuthSession {

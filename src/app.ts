@@ -8,8 +8,8 @@ import type { Mailer } from './mailer';
 import type { DigestService } from './digest';
 import { aiStatus, chatWithTeachingAgent } from './ai';
 import { extractTextFromFile } from './extract';
-import { signToken, verifyToken, verifyPassword, isLegacyHash, publicUser, generateTempPassword, type TokenPayload } from './auth';
-import { MAX_TEST_POINTS, type Question, type QuestionGrading, type Test, type TestSubmission, type ProctorSummary } from './types';
+import { signToken, verifyToken, verifyPassword, isLegacyHash, publicUser, generateOtp, hashOtp, otpMatches, type TokenPayload } from './auth';
+import { MAX_TEST_POINTS, type UserAccount, type Question, type QuestionGrading, type Test, type TestSubmission, type ProctorSummary } from './types';
 
 export interface Deps {
   store: Store;
@@ -79,7 +79,11 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   }
   const clientIp = (c: Context) => c.req.header('CF-Connecting-IP') || 'anon';
   // Hono caches the parsed body, so reading it here doesn't consume it for the handler
-  const loginLimiter = rateLimit(15 * 60_000, 10, async (c) => `${clientIp(c)}|${String((await body(c))?.email || '').toLowerCase()}`);
+  const emailKey = async (c: Context<AppEnv>) => `${clientIp(c)}|${String((await body(c))?.email || '').trim().toLowerCase()}`;
+  const loginLimiter = rateLimit(15 * 60_000, 10, emailKey);
+  // Sign-in codes: at most 5 code emails and 10 verification tries per IP + email per 15 minutes
+  const otpRequestLimiter = rateLimit(15 * 60_000, 5, emailKey);
+  const otpVerifyLimiter = rateLimit(15 * 60_000, 10, emailKey);
   const chatLimiter = rateLimit(60 * 60_000, 60, (c) => c.get('user')?.sub || clientIp(c));
 
   // -------------------------------------------------------------------------
@@ -179,30 +183,104 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   // -------------------------------------------------------------------------
   // Auth
   // -------------------------------------------------------------------------
-  app.post(
-    '/api/auth/login',
-    loginLimiter,
-    async (c) => {
-      const b = await body(c);
-      const email = String(b.email || '').trim().toLowerCase();
-      const password = String(b.password || '');
-      const user = email ? store.getUserByEmail(email) : undefined;
-      // Same message for "no such user" and "wrong password" — don't reveal which emails exist
-      if (!user || !(await verifyPassword(password, user.passwordHash))) {
-        return c.json({ error: 'არასწორი ელ-ფოსტა ან პაროლი / Invalid email or password' }, 401);
-      }
-      // Upgrade hashes imported from the old Node server to the Workers-native format
-      if (isLegacyHash(user.passwordHash)) await store.setPassword(user.email, password, user.isTemporaryPassword);
-      store.touchLogin(user);
-      return c.json({
-        success: true,
-        token: await signToken(user, config),
-        user: publicUser(user),
-        student: user.role === 'student' ? store.getStudentByEmail(user.email) || null : null,
-        requiresPasswordChange: Boolean(user.isTemporaryPassword),
-      });
+  /** Successful sign-in: same response for every method. */
+  async function sessionResponse(c: Context<AppEnv>, user: UserAccount) {
+    store.touchLogin(user);
+    return c.json({
+      success: true,
+      token: await signToken(user, config),
+      user: publicUser(user),
+      student: user.role === 'student' ? store.getStudentByEmail(user.email) || null : null,
+      requiresPasswordChange: user.role === 'admin' && Boolean(user.isTemporaryPassword),
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Passwordless sign-in: email → 6-digit code (10 min, single use, 5 tries) → session
+  // -------------------------------------------------------------------------
+  const OTP_TTL_MS = 10 * 60_000;
+  const OTP_RESEND_COOLDOWN_MS = 60_000;
+  const OTP_MAX_ATTEMPTS = 5;
+
+  /** Creates (or replaces) the user's code and emails it. Returns the code only to internal callers. */
+  async function issueOtp(user: UserAccount) {
+    const code = generateOtp();
+    store.putOtp(user.email, await hashOtp(user.email, code, config.jwtSecret), OTP_TTL_MS);
+    const emailed = await mailer.sendOtp({ to: user.email, name: user.name, code, minutes: OTP_TTL_MS / 60_000 });
+    return { code, emailed };
+  }
+
+  app.post('/api/auth/otp/request', otpRequestLimiter, async (c) => {
+    const email = String((await body(c))?.email || '').trim().toLowerCase();
+    if (!/^\S+@\S+\.\S+$/.test(email)) return c.json({ error: 'შეიყვანეთ სწორი ელ-ფოსტა / Enter a valid email' }, 400);
+    const generic = { success: true, expiresInSeconds: OTP_TTL_MS / 1000, resendAfterSeconds: OTP_RESEND_COOLDOWN_MS / 1000 };
+    const user = store.getUserByEmail(email);
+    // Unknown emails get the same answer, so the form doesn't reveal who is enrolled
+    if (!user) return c.json(generic);
+
+    const pending = store.getOtp(email);
+    if (pending && Date.now() - pending.createdAt < OTP_RESEND_COOLDOWN_MS) {
+      const wait = Math.ceil((OTP_RESEND_COOLDOWN_MS - (Date.now() - pending.createdAt)) / 1000);
+      c.header('Retry-After', String(wait));
+      return c.json({ error: `ახალი კოდის მოთხოვნა შეგიძლიათ ${wait} წამში / You can request a new code in ${wait}s`, retryAfterSeconds: wait }, 429);
     }
-  );
+
+    const { emailed } = await issueOtp(user);
+    if (!emailed) {
+      // The code exists but couldn't be delivered (e.g. Resend not set up for this address).
+      // The lecturer can read a sign-in code from the dashboard instead.
+      return c.json(
+        { error: 'კოდის გაგზავნა ვერ მოხერხდა. სთხოვეთ ლექტორს შესვლის კოდი. / The code could not be emailed. Ask your lecturer for a sign-in code.' },
+        502
+      );
+    }
+    return c.json(generic);
+  });
+
+  app.post('/api/auth/otp/verify', otpVerifyLimiter, async (c) => {
+    const b = await body(c);
+    const email = String(b?.email || '').trim().toLowerCase();
+    const code = String(b?.code || '').replace(/\D/g, '');
+    const invalid = () => c.json({ error: 'კოდი არასწორია ან ვადა გაუვიდა / The code is wrong or has expired' }, 400);
+    if (!email || code.length !== 6) return invalid();
+
+    const pending = store.getOtp(email);
+    const user = store.getUserByEmail(email);
+    if (!pending || !user) return invalid();
+    if (Date.now() > pending.expiresAt) {
+      store.deleteOtp(email);
+      return invalid();
+    }
+    if (!otpMatches(pending.codeHash, await hashOtp(email, code, config.jwtSecret))) {
+      if (store.bumpOtpAttempts(email) >= OTP_MAX_ATTEMPTS) {
+        store.deleteOtp(email);
+        return c.json({ error: 'ძალიან ბევრი მცდელობა. მოითხოვეთ ახალი კოდი. / Too many attempts. Request a new code.' }, 429);
+      }
+      return invalid();
+    }
+
+    store.deleteOtp(email); // single use
+    if (user.role === 'student' && user.isTemporaryPassword) {
+      user.isTemporaryPassword = false; // accounts from the password era
+      store.save('users', user);
+    }
+    return sessionResponse(c, user);
+  });
+
+  /** Lecturer's emergency sign-in with a password. Students have no passwords and use codes. */
+  app.post('/api/auth/login', loginLimiter, async (c) => {
+    const b = await body(c);
+    const email = String(b.email || '').trim().toLowerCase();
+    const password = String(b.password || '');
+    const user = email ? store.getUserByEmail(email) : undefined;
+    // Same message for "no such user", "not the lecturer" and "wrong password"
+    if (!user || user.role !== 'admin' || !(await verifyPassword(password, user.passwordHash))) {
+      return c.json({ error: 'არასწორი ელ-ფოსტა ან პაროლი / Invalid email or password' }, 401);
+    }
+    // Upgrade hashes imported from the old Node server to the Workers-native format
+    if (isLegacyHash(user.passwordHash)) await store.setPassword(user.email, password, user.isTemporaryPassword);
+    return sessionResponse(c, user);
+  });
 
   app.get('/api/auth/me', requireAuth, (c) => {
     const user = store.getUserById(c.get('user').sub);
@@ -213,7 +291,7 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     });
   });
 
-  app.post('/api/auth/change-password', requireAuth, async (c) => {
+  app.post('/api/auth/change-password', requireAdmin, async (c) => {
     const user = store.getUserById(c.get('user').sub);
     if (!user) return c.json({ error: 'User not found' }, 404);
     const { currentPassword, newPassword } = await body(c);
@@ -239,49 +317,98 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   // -------------------------------------------------------------------------
   app.get('/api/students', requireAdmin, (c) => c.json(store.getStudents()));
 
-  async function createStudent(name: string, email: string, department?: string) {
-    const tempPassword = generateTempPassword();
-    const { student, created } = await store.addStudent(
-      { name, email, department: department || 'ინოვაციური მეწარმეობა და სტარტაპები' },
-      tempPassword
-    );
-    let emailed = false;
-    if (created) emailed = await mailer.sendWelcome({ to: student.email, name: student.name, temporaryPassword: tempPassword });
-    // If email isn't configured/failed, return the password ONCE so the lecturer can hand it over.
-    return { student, created, emailed, temporaryPassword: created && !emailed ? tempPassword : undefined };
+  const DEFAULT_DEPARTMENT = 'მეწარმეობა და ინოვაციები';
+  const EMAIL_RE = /^[^\s@,;<>()]+@[^\s@,;<>()]+\.[^\s@,;<>()]+$/;
+
+  /** "giorgi.beridze_2@btu.edu.ge" → "Giorgi Beridze" (the lecturer can edit it later). */
+  const nameFromEmail = (email: string) =>
+    email
+      .split('@')[0]
+      .replace(/[0-9]+/g, ' ')
+      .split(/[._\-+\s]+/)
+      .filter(Boolean)
+      .map((w) => w[0].toUpperCase() + w.slice(1).toLowerCase())
+      .join(' ') || email.split('@')[0];
+
+  /**
+   * Creates the accounts (synchronously, in one go) and then sends all invitations in Resend
+   * batches. There are no passwords: invited students sign in with an emailed code.
+   */
+  async function inviteStudents(entries: { name?: string; email: string; department?: string }[]) {
+    const results: { email: string; name: string; status: 'created' | 'exists'; invited: boolean }[] = [];
+    const toInvite: { to: string; name: string }[] = [];
+    for (const e of entries) {
+      const name = (e.name || '').trim() || nameFromEmail(e.email);
+      const { student, created } = store.addStudent({ name, email: e.email, department: e.department || DEFAULT_DEPARTMENT });
+      results.push({ email: student.email, name: student.name, status: created ? 'created' : 'exists', invited: false });
+      if (created) toInvite.push({ to: student.email, name: student.name });
+    }
+    const delivered = new Set(toInvite.length ? await mailer.sendInvites(toInvite) : []);
+    for (const r of results) r.invited = delivered.has(r.email);
+    return results;
   }
 
   app.post('/api/students', requireAdmin, async (c) => {
     const { name, email, department, digestSubscribed } = await body(c);
-    if (!name || !email || !/^\S+@\S+\.\S+$/.test(email)) {
+    if (!name || !email || !EMAIL_RE.test(String(email).trim())) {
       return c.json({ error: 'Valid name and email are required' }, 400);
     }
-    const result = await createStudent(String(name), String(email), department);
-    if (result.created && digestSubscribed === false) store.updateStudentSubscription(result.student.email, false);
+    const [r] = await inviteStudents([{ name: String(name), email: String(email).trim().toLowerCase(), department }]);
+    const student = store.getStudentByEmail(r.email)!;
+    if (r.status === 'created' && digestSubscribed === false) store.updateStudentSubscription(student.email, false);
     // keep backwards compatibility: frontend expects the student object at top level
-    return c.json({ ...result.student, _meta: { created: result.created, emailed: result.emailed, temporaryPassword: result.temporaryPassword } });
+    return c.json({ ...student, _meta: { created: r.status === 'created', emailed: r.invited } });
   });
 
-  /** Bulk import: [{ name, email }] — e.g. pasted from the BTU class list */
+  /**
+   * Bulk invite: paste emails separated by commas, semicolons, spaces or new lines
+   * (`{ emails: "a@x.ge, b@x.ge" }` or `{ emails: [...] }`), or the older `{ students: [{ name, email }] }`.
+   */
+  app.post('/api/students/invite', requireAdmin, async (c) => {
+    const b = await body(c);
+    const raw: string[] = Array.isArray(b?.emails) ? b.emails.map(String) : String(b?.emails || '').split(/[\s,;]+/);
+    const seen = new Set<string>();
+    const valid: string[] = [];
+    const invalid: string[] = [];
+    for (const item of raw) {
+      // accept "Name <email>" as pasted from mail clients
+      const email = (/<([^>]+)>/.exec(item)?.[1] || item).trim().replace(/^mailto:/i, '').toLowerCase();
+      if (!email || !email.includes('@')) continue; // names pasted along with "Name <email>"
+      if (!EMAIL_RE.test(email)) invalid.push(item.trim());
+      else if (!seen.has(email)) {
+        seen.add(email);
+        valid.push(email);
+      }
+    }
+    if (valid.length > 500) return c.json({ error: 'At most 500 emails per invite' }, 400);
+    const results = await inviteStudents(valid.map((email) => ({ email, department: b?.department })));
+    return c.json({
+      created: results.filter((r) => r.status === 'created').length,
+      existing: results.filter((r) => r.status === 'exists').length,
+      invited: results.filter((r) => r.invited).length,
+      invalid,
+      results,
+    });
+  });
+
   app.post('/api/students/bulk', requireAdmin, async (c) => {
     const b = await body(c);
-    const list = Array.isArray(b?.students) ? b.students : [];
-    const results: { email: string; created: boolean; emailed: boolean; temporaryPassword?: string }[] = [];
-    for (const s of list.slice(0, 500)) {
-      if (!s?.name || !s?.email) continue;
-      const r = await createStudent(String(s.name), String(s.email), s.department);
-      results.push({ email: r.student.email, created: r.created, emailed: r.emailed, temporaryPassword: r.temporaryPassword });
-    }
+    const list = (Array.isArray(b?.students) ? b.students : []).filter((s: any) => s?.email && EMAIL_RE.test(String(s.email).trim()));
+    const results = await inviteStudents(
+      list.slice(0, 500).map((s: any) => ({ name: s.name ? String(s.name) : undefined, email: String(s.email).trim().toLowerCase(), department: s.department }))
+    );
     return c.json({ count: results.length, results });
   });
 
-  app.post('/api/students/:email/reset-password', requireAdmin, async (c) => {
+  /**
+   * Lecturer fallback when a student's code email can't be delivered: issues a fresh sign-in code,
+   * tries to email it, and shows it to the lecturer to pass on if the email didn't go out.
+   */
+  app.post('/api/students/:email/login-code', requireAdmin, async (c) => {
     const user = store.getUserByEmail(c.req.param('email'));
     if (!user || user.role !== 'student') return c.json({ error: 'Student not found' }, 404);
-    const temp = generateTempPassword();
-    await store.setPassword(user.email, temp, true);
-    const emailed = await mailer.sendWelcome({ to: user.email, name: user.name, temporaryPassword: temp });
-    return c.json({ success: true, emailed, temporaryPassword: emailed ? undefined : temp });
+    const { code, emailed } = await issueOtp(user);
+    return c.json({ success: true, emailed, expiresInSeconds: OTP_TTL_MS / 1000, code: emailed ? undefined : code });
   });
 
   /** Lecturer edits a student's details. Changing the email also moves their login and records. */

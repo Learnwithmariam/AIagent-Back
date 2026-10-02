@@ -64,11 +64,25 @@ export async function verifyPassword(password: string, stored: string | undefine
 
 export const isLegacyHash = (stored: string | undefined) => Boolean(stored?.startsWith('scrypt$'));
 
-/** Readable random password for first login, e.g. "Kx7p-Q2mv-9Tzd" */
-export function generateTempPassword(): string {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
-  const block = () => Array.from({ length: 4 }, () => alphabet[randomInt(alphabet.length)]).join('');
-  return `${block()}-${block()}-${block()}`;
+// ---------- One-time sign-in codes ----------
+
+/** 6-digit code, uniformly random (leading zeros allowed). */
+export function generateOtp(): string {
+  return String(randomInt(1_000_000)).padStart(6, '0');
+}
+
+/**
+ * HMAC-SHA256(secret, email:code). Only this hash is stored, so a database leak doesn't reveal
+ * live codes, and the 10^6 code space can't be brute-forced offline without the server secret.
+ */
+export async function hashOtp(email: string, code: string, secret: string): Promise<string> {
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const mac = await crypto.subtle.sign('HMAC', key, enc.encode(`${email.trim().toLowerCase()}:${code}`));
+  return toHex(new Uint8Array(mac));
+}
+
+export function otpMatches(storedHash: string, candidateHash: string): boolean {
+  return timingSafeEqual(fromHex(storedHash), fromHex(candidateHash));
 }
 
 // ---------- Tokens ----------
