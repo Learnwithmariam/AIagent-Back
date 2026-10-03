@@ -121,6 +121,8 @@ Every `/api/*` route needs `Authorization: Bearer <token>` except `/api/health` 
 
 - `GET /api/ai/status`: `{ configured }`. Which provider answers is not exposed.
 - `POST /api/agent/chat`: routing is server-side only; a client-sent `model` is ignored.
+- `GET /api/students` (lecturer): each student also carries `hasLoggedIn`, `firstLoginAt` and `lastLoginAt` (set when an OTP code is verified), so the admin list can show Active vs Pending.
+- Sessions last 90 days (`JWT_EXPIRES_IN = "90d"`). Every authenticated request also checks the account still exists, so deleting a student signs them out immediately.
 - `PATCH /api/students/:email` (lecturer): edit a student's name, email, department or digest subscription. An email change also moves their login and records.
 - `POST /api/cron/trigger` returns `digest: null` when there is nothing new.
 - `POST /api/auth/otp/request` `{ email }` and `POST /api/auth/otp/verify` `{ email, code }`: passwordless sign-in.

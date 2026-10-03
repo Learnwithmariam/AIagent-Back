@@ -15,6 +15,9 @@ export interface UserAccount {
   /** @deprecated always false now that sign-in is passwordless */
   isTemporaryPassword: boolean;
   createdAt?: string;
+  /** First successful sign-in (set once). Missing = invited but never signed in. */
+  firstLoginAt?: string;
+  /** Most recent successful sign-in */
   lastLoginAt?: string;
   department?: string;
 }

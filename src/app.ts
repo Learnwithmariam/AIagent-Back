@@ -92,6 +92,9 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     const header = c.req.header('Authorization') || '';
     const payload = await verifyToken(header.startsWith('Bearer ') ? header.slice(7) : '', config);
     if (!payload) return c.json({ error: 'Authentication required' }, 401);
+    // Sessions last 90 days, so check the account still exists (a deleted student is signed out at once)
+    const account = store.getUserById(payload.sub);
+    if (!account || account.email.toLowerCase() !== payload.email.toLowerCase()) return c.json({ error: 'Authentication required' }, 401);
     c.set('user', payload);
     return next();
   };
@@ -175,7 +178,7 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     if (config.isProd && origin && !config.frontendOrigins.includes(origin)) return c.text('Origin not allowed', 403);
     // Auth: token is passed as ?token=... (browsers can't set headers on WebSocket)
     const user = await verifyToken(c.req.query('token') || '', config);
-    if (!user) return c.text('Unauthorized', 401);
+    if (!user || !store.getUserById(user.sub)) return c.text('Unauthorized', 401);
     return proctor.accept(user);
   });
 
@@ -282,7 +285,15 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   // -------------------------------------------------------------------------
   // Students (admin)
   // -------------------------------------------------------------------------
-  app.get('/api/students', requireAdmin, (c) => c.json(store.getStudents()));
+  /** Students plus their sign-in status: `lastLoginAt` null = invited but never signed in ("Pending"). */
+  app.get('/api/students', requireAdmin, (c) =>
+    c.json(
+      store.getStudents().map((s) => {
+        const u = store.getUserByEmail(s.email);
+        return { ...s, firstLoginAt: u?.firstLoginAt || u?.lastLoginAt || null, lastLoginAt: u?.lastLoginAt || null, hasLoggedIn: Boolean(u?.lastLoginAt) };
+      })
+    )
+  );
 
   const DEFAULT_DEPARTMENT = 'მეწარმეობა და ინოვაციები';
   const EMAIL_RE = /^[^\s@,;<>()]+@[^\s@,;<>()]+\.[^\s@,;<>()]+$/;

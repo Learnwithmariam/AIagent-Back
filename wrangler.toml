@@ -27,7 +27,8 @@ ENVIRONMENT = "production"
 FRONTEND_URL = "https://btustudents.online,https://www.btustudents.online,https://aiagent-front.giorgi-khatiashvili-9e4.workers.dev"
 # Links in emails (invites) point here
 PUBLIC_APP_URL = "https://btustudents.online"
-JWT_EXPIRES_IN = "12h"
+# Sign-in lasts 90 days on a device (sessions end early if the account is deleted)
+JWT_EXPIRES_IN = "90d"
 ADMIN_EMAIL = "giorgi.khatiashvili@btu.edu.ge"
 ADMIN_NAME = "Prof. Giorgi Khatiashvili"
 # AI routing (server-side, invisible to students): Gemini models first, in this order...

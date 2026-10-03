@@ -251,8 +251,11 @@ export class Store {
     return this.data.users.find((u) => u.id === id);
   }
 
+  /** Records a successful sign-in: first time (kept forever) and latest. */
   touchLogin(user: UserAccount) {
-    user.lastLoginAt = new Date().toISOString();
+    const now = new Date().toISOString();
+    user.firstLoginAt ??= user.lastLoginAt || now; // accounts that signed in before this field existed keep their history
+    user.lastLoginAt = now;
     this.save('users', user);
   }
 

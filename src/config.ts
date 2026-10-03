@@ -79,7 +79,7 @@ export function buildConfig(env: Env) {
     publicAppUrl: env.PUBLIC_APP_URL || 'http://localhost:5173',
 
     jwtSecret: env.JWT_SECRET || 'dev-only-insecure-secret-change-me',
-    jwtExpiresInSeconds: parseDuration(env.JWT_EXPIRES_IN, 12 * 3600),
+    jwtExpiresInSeconds: parseDuration(env.JWT_EXPIRES_IN, 90 * 86400),
 
     /** The single administrator. Admin rights come from this email alone, never from stored roles. */
     adminEmail: (env.ADMIN_EMAIL || DEFAULT_ADMIN_EMAIL).trim().toLowerCase(),
