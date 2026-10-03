@@ -9,9 +9,10 @@ export interface Env {
 
   // secrets
   JWT_SECRET?: string;
-  ADMIN_PASSWORD?: string;
+  GEMINI_API_KEY?: string;
   OPENROUTER_API_KEY?: string;
   RESEND_API_KEY?: string;
+  BREVO_API_KEY?: string;
 
   // vars
   ENVIRONMENT?: string;
@@ -20,11 +21,13 @@ export interface Env {
   JWT_EXPIRES_IN?: string;
   ADMIN_EMAIL?: string;
   ADMIN_NAME?: string;
+  GEMINI_MODELS?: string;
   OPENROUTER_MODELS?: string;
   OPENROUTER_DIGEST_MODEL?: string;
   DIGEST_FEEDS?: string;
   MAIL_FROM?: string;
   DIGEST_ENABLED?: string;
+  DIGEST_EMAIL?: string;
   DIGEST_TIMEZONE?: string;
   EXAM_MAX_PAUSES?: string;
   EXAM_SUBMIT_GRACE_SECONDS?: string;
@@ -32,18 +35,21 @@ export interface Env {
 
 export const APP_NAME = 'G.K. BTU Students';
 
+/** The one and only administrator. ADMIN_EMAIL can override it, but there is never more than one. */
+export const DEFAULT_ADMIN_EMAIL = 'giorgi.khatiashvili@btu.edu.ge';
+
 /**
  * Free OpenRouter models tried in order when OPENROUTER_MODELS isn't set.
  * The free catalogue changes often — check https://openrouter.ai/models?max_price=0
  * and override the list in wrangler.toml instead of editing code.
  */
-export const DEFAULT_FREE_MODELS = [
-  'meta-llama/llama-3.3-70b-instruct:free',
-  'deepseek/deepseek-chat-v3-0324:free',
-  'google/gemma-3-27b-it:free',
-  'mistralai/mistral-small-3.2-24b-instruct:free',
-  'qwen/qwen3-235b-a22b:free',
-];
+export const DEFAULT_FREE_MODELS = ['google/gemma-4-31b-it:free', 'qwen/qwen3.8-27b:free', 'z-ai/glm-5.2:free'];
+
+/**
+ * Gemini models tried in order before falling back to OpenRouter. gemini-1.5-flash has been
+ * retired by Google (404), so the default is its current Flash successor. Override with GEMINI_MODELS.
+ */
+export const DEFAULT_GEMINI_MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-flash-lite-latest'];
 
 const list = (v: string | undefined) =>
   (v || '')
@@ -73,28 +79,38 @@ export function buildConfig(env: Env) {
     publicAppUrl: env.PUBLIC_APP_URL || 'http://localhost:5173',
 
     jwtSecret: env.JWT_SECRET || 'dev-only-insecure-secret-change-me',
-    jwtExpiresInSeconds: parseDuration(env.JWT_EXPIRES_IN, 12 * 3600),
+    jwtExpiresInSeconds: parseDuration(env.JWT_EXPIRES_IN, 90 * 86400),
 
-    /** Bootstrap admin — created on first start only if no admin exists. */
-    adminEmail: (env.ADMIN_EMAIL || '').trim().toLowerCase(),
+    /** The single administrator. Admin rights come from this email alone, never from stored roles. */
+    adminEmail: (env.ADMIN_EMAIL || DEFAULT_ADMIN_EMAIL).trim().toLowerCase(),
     adminName: env.ADMIN_NAME || 'Prof. Giorgi Khatiashvili',
-    adminPassword: env.ADMIN_PASSWORD || '',
+
+    /** Primary AI provider for the chat (and digest). Falls back to OpenRouter silently. */
+    gemini: {
+      apiKey: env.GEMINI_API_KEY || '',
+      models: list(env.GEMINI_MODELS).length ? list(env.GEMINI_MODELS) : DEFAULT_GEMINI_MODELS,
+    },
 
     openrouter: {
       apiKey: env.OPENROUTER_API_KEY || '',
-      /** Models students may pick in the chat; the first is the default. Fallbacks follow the same order. */
+      /** Fallback models when Gemini fails, tried in this order. */
       chatModels,
       /** The digest only ever uses free (":free") models, so it never costs anything. */
       digestModels: [...new Set([env.OPENROUTER_DIGEST_MODEL, ...chatModels].filter((m): m is string => Boolean(m?.endsWith(':free'))))],
     },
 
     mail: {
+      /** Primary provider (300 free emails/day); Resend is the fallback */
+      brevoApiKey: env.BREVO_API_KEY || '',
       resendApiKey: env.RESEND_API_KEY || '',
-      from: env.MAIL_FROM || `${APP_NAME} <noreply@example.com>`,
+      /** Empty = send from noreply@<the Resend account's verified domain>, looked up at runtime */
+      from: (env.MAIL_FROM || '').trim(),
     },
 
     digest: {
       enabled: env.DIGEST_ENABLED !== 'false',
+      /** Whether the daily 08:00 run emails subscribers. Generating from the dashboard never emails. */
+      emailEnabled: env.DIGEST_EMAIL !== 'false',
       /** Free public RSS/Atom feeds the digest reads news from */
       feeds: list(env.DIGEST_FEEDS).length ? list(env.DIGEST_FEEDS) : DEFAULT_FEEDS,
       timezone: env.DIGEST_TIMEZONE || 'Asia/Tbilisi',

@@ -1,18 +1,34 @@
 export type Role = 'student' | 'admin';
 
+/** Every quiz/exam is scored out of at most 10 points. */
+export const MAX_TEST_POINTS = 10;
+
 export interface UserAccount {
   id: string;
   email: string;
   name: string;
   role: Role;
-  /** scrypt hash — never sent to the client */
+  /** @deprecated passwords were removed; may still exist on old records and is never sent out */
   passwordHash?: string;
-  /** @deprecated legacy plaintext field, migrated to passwordHash on load */
+  /** @deprecated legacy plaintext field from the first prototype */
   temporaryPassword?: string;
+  /** @deprecated always false now that sign-in is passwordless */
   isTemporaryPassword: boolean;
   createdAt?: string;
+  /** First successful sign-in (set once). Missing = invited but never signed in. */
+  firstLoginAt?: string;
+  /** Most recent successful sign-in */
   lastLoginAt?: string;
   department?: string;
+}
+
+/** A pending sign-in code (table otp_codes). Only a hash of the 6-digit code is stored. */
+export interface OtpRecord {
+  email: string;
+  codeHash: string;
+  expiresAt: number;
+  attempts: number;
+  createdAt: number;
 }
 
 export interface AuthSession {

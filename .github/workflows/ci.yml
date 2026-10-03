@@ -1,0 +1,24 @@
+name: Typecheck API
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-api-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # CI only. Deploys are done directly with `npm run deploy` (wrangler), not from GitHub.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck

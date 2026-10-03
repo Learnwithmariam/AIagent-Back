@@ -1,16 +1,18 @@
-import type {
-  Student,
-  KnowledgeDoc,
-  Test,
-  TestSubmission,
-  ProctorEvent,
-  DailyDigest,
-  UserAccount,
-  ExamAttempt,
-  ActiveExamSession,
+import {
+  MAX_TEST_POINTS,
+  type Student,
+  type KnowledgeDoc,
+  type Test,
+  type TestSubmission,
+  type ProctorEvent,
+  type DailyDigest,
+  type UserAccount,
+  type ExamAttempt,
+  type ActiveExamSession,
+  type OtpRecord,
 } from './types';
 import type { Config } from './config';
-import { hashPassword, randomHex } from './auth';
+import { randomHex } from './auth';
 import { SEED_KNOWLEDGE, SEED_TESTS } from './seed';
 
 /**
@@ -56,6 +58,14 @@ export class Store {
       PRIMARY KEY (coll, id))`);
     sql.exec(`CREATE INDEX IF NOT EXISTS records_seq ON records (coll, seq)`);
     sql.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+    // One pending sign-in code per email. Only a hash of the code is stored, never the code itself.
+    sql.exec(`CREATE TABLE IF NOT EXISTS otp_codes (
+      email TEXT PRIMARY KEY,
+      code_hash TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,   -- ms since epoch
+      attempts INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL    -- ms since epoch, also used for the resend cooldown
+    )`);
     this.load();
   }
 
@@ -67,7 +77,72 @@ export class Store {
       for (const t of [...SEED_TESTS].reverse()) this.insert('tests', t);
       this.sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('seeded', '1')`);
     }
-    await this.ensureAdmin();
+    this.migrateToTenPointScale();
+    this.ensureAdmin();
+  }
+
+  /**
+   * One-off: quizzes used to be scored out of up to 100 points; now the maximum is 10.
+   * Rescales every test above 10 points (and its submissions' scores) proportionally, so
+   * percentages and pass/fail stay the same.
+   */
+  private migrateToTenPointScale() {
+    if (this.sql.exec(`SELECT value FROM meta WHERE key = 'points_max_10'`).toArray().length) return;
+    const r1 = (n: number) => Math.round(n * 10) / 10;
+
+    for (const test of this.data.tests) {
+      const oldPoints = test.questions.map((q) => Number(q.points) || 0);
+      const oldTotal = oldPoints.reduce((a, b) => a + b, 0);
+      if (oldTotal <= MAX_TEST_POINTS) continue;
+
+      // Scale to 10 in half-point steps, handing leftover halves to the largest remainders
+      const exact = oldPoints.map((p) => (p / oldTotal) * MAX_TEST_POINTS);
+      const newPoints = exact.map((x) => Math.max(0.5, Math.floor(x * 2) / 2));
+      let left = MAX_TEST_POINTS - newPoints.reduce((a, b) => a + b, 0);
+      const byRemainder = exact.map((x, i) => ({ i, r: x - newPoints[i] })).sort((a, b) => b.r - a.r);
+      for (let k = 0; left >= 0.5 && byRemainder.length; k = (k + 1) % byRemainder.length) {
+        newPoints[byRemainder[k].i] += 0.5;
+        left -= 0.5;
+      }
+      // Many tiny questions can overshoot because of the 0.5 minimum: trim from the largest
+      while (left < 0 && newPoints.some((p) => p > 0.5)) {
+        const i = newPoints.indexOf(Math.max(...newPoints));
+        newPoints[i] -= 0.5;
+        left += 0.5;
+      }
+      const factor = new Map(test.questions.map((q, i) => [q.id, oldPoints[i] > 0 ? newPoints[i] / oldPoints[i] : 0]));
+      test.questions.forEach((q, i) => (q.points = newPoints[i]));
+      test.totalPoints = r1(newPoints.reduce((a, b) => a + b, 0));
+      this.save('tests', test);
+
+      for (const sub of this.data.submissions.filter((x) => x.testId === test.id)) {
+        const grading = sub.grading || sub.questionGradings || {};
+        for (const g of Object.values(grading)) {
+          const f = factor.get(g.questionId) ?? MAX_TEST_POINTS / oldTotal;
+          g.earnedPoints = r1(g.earnedPoints * f);
+          g.maxPoints = r1(g.maxPoints * f);
+        }
+        sub.grading = grading;
+        sub.questionGradings = grading;
+        sub.totalScore = r1(Object.values(grading).reduce((n, g) => n + g.earnedPoints, 0));
+        sub.maxScore = test.totalPoints;
+        this.save('submissions', sub);
+      }
+    }
+
+    // Submissions whose test was deleted: scale the totals only
+    for (const sub of this.data.submissions) {
+      if (sub.maxScore <= MAX_TEST_POINTS || this.getTestById(sub.testId)) continue;
+      const f = MAX_TEST_POINTS / sub.maxScore;
+      for (const g of Object.values(sub.grading || sub.questionGradings || {})) {
+        g.earnedPoints = r1(g.earnedPoints * f);
+        g.maxPoints = r1(g.maxPoints * f);
+      }
+      sub.totalScore = r1(sub.totalScore * f);
+      sub.maxScore = MAX_TEST_POINTS;
+      this.save('submissions', sub);
+    }
+    this.sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('points_max_10', '1')`);
   }
 
   private load() {
@@ -103,19 +178,29 @@ export class Store {
     return gone.length;
   }
 
-  /** Creates the lecturer account from ADMIN_EMAIL / ADMIN_PASSWORD on first boot. */
-  private async ensureAdmin() {
-    if (this.data.users.some((u) => u.role === 'admin')) return;
-    if (!this.config.adminEmail || !this.config.adminPassword) {
-      console.warn('No admin account exists. Set ADMIN_EMAIL (var) and ADMIN_PASSWORD (secret) to create one.');
-      return;
+  /**
+   * Makes sure exactly one admin exists: the configured admin email. Any other account that was
+   * stored as an admin (e.g. from an old import) loses that role. No password is involved: the
+   * admin signs in with an emailed code like everyone else.
+   */
+  private ensureAdmin() {
+    for (const u of this.data.users) {
+      const shouldBeAdmin = u.email.toLowerCase() === this.config.adminEmail;
+      if (u.role === 'admin' && !shouldBeAdmin) {
+        u.role = 'student';
+        this.save('users', u);
+        console.warn(`Removed admin role from ${u.email}: only ${this.config.adminEmail} is an admin.`);
+      } else if (shouldBeAdmin && u.role !== 'admin') {
+        u.role = 'admin';
+        this.save('users', u);
+      }
     }
+    if (this.getUserByEmail(this.config.adminEmail)) return;
     this.insert('users', {
       id: newId('user-admin'),
       email: this.config.adminEmail,
       name: this.config.adminName,
       role: 'admin',
-      passwordHash: await hashPassword(this.config.adminPassword),
       isTemporaryPassword: false,
       createdAt: new Date().toISOString(),
     });
@@ -124,16 +209,14 @@ export class Store {
 
   /**
    * One-off migration: replace everything with a db.json exported from the old Node server.
-   * Legacy scrypt password hashes keep working (see auth.ts).
+   * Passwords are dropped: everyone signs in with emailed codes now.
    */
   async importLegacy(dump: Partial<Record<Name, any[]>>) {
-    // hash any plaintext prototype passwords before touching storage
     for (const u of Array.isArray(dump.users) ? dump.users : []) {
-      if (u?.temporaryPassword && !u.passwordHash) {
-        u.passwordHash = await hashPassword(String(u.temporaryPassword));
-        u.isTemporaryPassword = true; // force a change after migration
-      }
-      if (u) delete u.temporaryPassword;
+      if (!u) continue;
+      delete u.temporaryPassword;
+      delete u.passwordHash;
+      u.isTemporaryPassword = false;
     }
     this.sql.exec(`DELETE FROM records`);
     this.seq = 0;
@@ -147,6 +230,10 @@ export class Store {
       }
     }
     this.sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('seeded', '1')`);
+    this.ensureAdmin();
+    // imported data may still be on the old 100-point scale
+    this.sql.exec(`DELETE FROM meta WHERE key = 'points_max_10'`);
+    this.migrateToTenPointScale();
     return Object.fromEntries(ALL.map((n) => [n, this.data[n].length]));
   }
 
@@ -164,18 +251,12 @@ export class Store {
     return this.data.users.find((u) => u.id === id);
   }
 
+  /** Records a successful sign-in: first time (kept forever) and latest. */
   touchLogin(user: UserAccount) {
-    user.lastLoginAt = new Date().toISOString();
+    const now = new Date().toISOString();
+    user.firstLoginAt ??= user.lastLoginAt || now; // accounts that signed in before this field existed keep their history
+    user.lastLoginAt = now;
     this.save('users', user);
-  }
-
-  async setPassword(email: string, newPassword: string, temporary: boolean): Promise<UserAccount | null> {
-    const user = this.getUserByEmail(email);
-    if (!user) return null;
-    user.passwordHash = await hashPassword(newPassword);
-    user.isTemporaryPassword = temporary;
-    this.save('users', user);
-    return user;
   }
 
   // ---------- Students ----------
@@ -188,19 +269,14 @@ export class Store {
     return this.data.students.find((s) => s.email.toLowerCase() === e);
   }
 
-  /** Creates the Student profile + login account with the given temporary password. */
-  async addStudent(
-    input: { name: string; email: string; department: string },
-    tempPassword: string
-  ): Promise<{ student: Student; created: boolean }> {
+  /**
+   * Creates the Student profile + login account. Students sign in with emailed one-time codes,
+   * so there is no password: the account only needs the email.
+   */
+  addStudent(input: { name: string; email: string; department: string }): { student: Student; created: boolean } {
     const email = input.email.trim().toLowerCase();
     const existing = this.getStudentByEmail(email);
     if (existing) return { student: existing, created: false };
-
-    const passwordHash = await hashPassword(tempPassword);
-    // re-check after the await: another request may have created it meanwhile
-    const raced = this.getStudentByEmail(email);
-    if (raced) return { student: raced, created: false };
 
     const student: Student = {
       id: newId('std'),
@@ -219,8 +295,7 @@ export class Store {
         email,
         name: student.name,
         role: 'student',
-        passwordHash,
-        isTemporaryPassword: true,
+        isTemporaryPassword: false,
         createdAt: new Date().toISOString(),
         department: student.department,
       });
@@ -228,8 +303,60 @@ export class Store {
     return { student, created: true };
   }
 
+  /** Edit a student's profile (and matching login). An email change also moves their records. */
+  updateStudent(
+    email: string,
+    updates: { name?: string; email?: string; department?: string; digestSubscribed?: boolean }
+  ): Student | 'not_found' | 'email_taken' {
+    const student = this.getStudentByEmail(email);
+    if (!student) return 'not_found';
+    const oldEmail = student.email.toLowerCase();
+    const newEmail = updates.email?.trim().toLowerCase() || oldEmail;
+    if (newEmail !== oldEmail && (this.getStudentByEmail(newEmail) || this.getUserByEmail(newEmail))) return 'email_taken';
+
+    if (updates.name !== undefined) student.name = updates.name;
+    if (updates.department !== undefined) student.department = updates.department;
+    if (updates.digestSubscribed !== undefined) student.digestSubscribed = updates.digestSubscribed;
+    student.email = newEmail;
+    this.save('students', student);
+
+    const user = this.data.users.find((u) => u.role === 'student' && u.email.toLowerCase() === oldEmail);
+    if (user) {
+      user.email = newEmail;
+      user.name = student.name;
+      user.department = student.department;
+      this.save('users', user);
+    }
+
+    if (newEmail !== oldEmail) {
+      for (const s of this.data.submissions.filter((x) => x.studentEmail.toLowerCase() === oldEmail)) {
+        s.studentEmail = newEmail;
+        s.studentName = student.name;
+        this.save('submissions', s);
+      }
+      for (const a of this.data.attempts.filter((x) => x.studentEmail.toLowerCase() === oldEmail)) {
+        a.studentEmail = newEmail;
+        this.save('attempts', a);
+      }
+      for (const e of this.data.proctorEvents.filter((x) => x.studentEmail.toLowerCase() === oldEmail)) {
+        e.studentEmail = newEmail;
+        this.save('proctorEvents', e);
+      }
+      // live sessions are keyed by email; the student simply rejoins under the new one
+      this.remove('sessions', (x) => x.studentEmail === oldEmail);
+      this.deleteOtp(oldEmail);
+    } else if (updates.name !== undefined) {
+      for (const s of this.data.submissions.filter((x) => x.studentEmail.toLowerCase() === oldEmail)) {
+        s.studentName = student.name;
+        this.save('submissions', s);
+      }
+    }
+    return student;
+  }
+
   deleteStudent(email: string): boolean {
     const e = email.toLowerCase();
+    this.deleteOtp(e);
     const removed = this.remove('students', (s) => s.email.toLowerCase() === e);
     this.remove('users', (u) => u.role === 'student' && u.email.toLowerCase() === e);
     return removed > 0;
@@ -279,7 +406,7 @@ export class Store {
     const { id: _ignore, createdAt: _c, ...safe } = updates;
     Object.assign(test, safe);
     if (Array.isArray(test.questions)) {
-      test.totalPoints = test.questions.reduce((acc, q) => acc + (Number(q.points) || 0), 0);
+      test.totalPoints = Math.round(test.questions.reduce((acc, q) => acc + (Number(q.points) || 0), 0) * 10) / 10;
     }
     this.save('tests', test);
     return test;
@@ -404,6 +531,41 @@ export class Store {
   pruneSessions(maxAgeMs = 24 * 3600_000) {
     const cutoff = Date.now() - maxAgeMs;
     this.remove('sessions', (s) => new Date(s.lastHeartbeat).getTime() < cutoff);
+  }
+
+  // ---------- One-time sign-in codes ----------
+  getOtp(email: string): OtpRecord | undefined {
+    const row = this.sql
+      .exec<{ email: string; code_hash: string; expires_at: number; attempts: number; created_at: number }>(
+        `SELECT * FROM otp_codes WHERE email = ?`,
+        email.toLowerCase()
+      )
+      .toArray()[0];
+    return row && { email: row.email, codeHash: row.code_hash, expiresAt: row.expires_at, attempts: row.attempts, createdAt: row.created_at };
+  }
+
+  /** Replaces any earlier code for this email, so only the newest one works. */
+  putOtp(email: string, codeHash: string, ttlMs: number) {
+    const now = Date.now();
+    this.sql.exec(
+      `INSERT OR REPLACE INTO otp_codes (email, code_hash, expires_at, attempts, created_at) VALUES (?, ?, ?, 0, ?)`,
+      email.toLowerCase(),
+      codeHash,
+      now + ttlMs,
+      now
+    );
+    // housekeeping: drop codes that expired more than a day ago
+    this.sql.exec(`DELETE FROM otp_codes WHERE expires_at < ?`, now - 86_400_000);
+  }
+
+  /** Counts a wrong guess; returns the new attempt count. */
+  bumpOtpAttempts(email: string): number {
+    this.sql.exec(`UPDATE otp_codes SET attempts = attempts + 1 WHERE email = ?`, email.toLowerCase());
+    return this.getOtp(email)?.attempts ?? 0;
+  }
+
+  deleteOtp(email: string) {
+    this.sql.exec(`DELETE FROM otp_codes WHERE email = ?`, email.toLowerCase());
   }
 
   // ---------- Digests ----------

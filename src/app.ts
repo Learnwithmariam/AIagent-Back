@@ -6,10 +6,10 @@ import type { Store } from './store';
 import type { ProctorHub } from './proctor';
 import type { Mailer } from './mailer';
 import type { DigestService } from './digest';
-import { availableModels, chatWithTeachingAgent } from './ai';
+import { aiStatus, chatWithTeachingAgent } from './ai';
 import { extractTextFromFile } from './extract';
-import { signToken, verifyToken, verifyPassword, isLegacyHash, publicUser, generateTempPassword, type TokenPayload } from './auth';
-import type { Question, QuestionGrading, Test, TestSubmission, ProctorSummary } from './types';
+import { signToken, verifyToken, publicUser, generateOtp, hashOtp, otpMatches, roleFor, type TokenPayload } from './auth';
+import { MAX_TEST_POINTS, type UserAccount, type Question, type QuestionGrading, type Test, type TestSubmission, type ProctorSummary } from './types';
 
 export interface Deps {
   store: Store;
@@ -79,7 +79,10 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   }
   const clientIp = (c: Context) => c.req.header('CF-Connecting-IP') || 'anon';
   // Hono caches the parsed body, so reading it here doesn't consume it for the handler
-  const loginLimiter = rateLimit(15 * 60_000, 10, async (c) => `${clientIp(c)}|${String((await body(c))?.email || '').toLowerCase()}`);
+  const emailKey = async (c: Context<AppEnv>) => `${clientIp(c)}|${String((await body(c))?.email || '').trim().toLowerCase()}`;
+  // Sign-in codes: at most 5 code emails and 10 verification tries per IP + email per 15 minutes
+  const otpRequestLimiter = rateLimit(15 * 60_000, 5, emailKey);
+  const otpVerifyLimiter = rateLimit(15 * 60_000, 10, emailKey);
   const chatLimiter = rateLimit(60 * 60_000, 60, (c) => c.get('user')?.sub || clientIp(c));
 
   // -------------------------------------------------------------------------
@@ -89,6 +92,9 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     const header = c.req.header('Authorization') || '';
     const payload = await verifyToken(header.startsWith('Bearer ') ? header.slice(7) : '', config);
     if (!payload) return c.json({ error: 'Authentication required' }, 401);
+    // Sessions last 90 days, so check the account still exists (a deleted student is signed out at once)
+    const account = store.getUserById(payload.sub);
+    if (!account || account.email.toLowerCase() !== payload.email.toLowerCase()) return c.json({ error: 'Authentication required' }, 401);
     c.set('user', payload);
     return next();
   };
@@ -116,6 +122,9 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
           test.questions.map((q) => ({ id: q.id, type: q.type, points: q.points, prompt: '' })),
     };
   }
+
+  /** Points may be fractional (e.g. 2.5 of 10); keep one decimal to avoid float noise. */
+  const roundPts = (n: number) => Math.round(n * 10) / 10;
 
   function isWithinWindow(test: Test) {
     const now = Date.now();
@@ -169,63 +178,105 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     if (config.isProd && origin && !config.frontendOrigins.includes(origin)) return c.text('Origin not allowed', 403);
     // Auth: token is passed as ?token=... (browsers can't set headers on WebSocket)
     const user = await verifyToken(c.req.query('token') || '', config);
-    if (!user) return c.text('Unauthorized', 401);
+    if (!user || !store.getUserById(user.sub)) return c.text('Unauthorized', 401);
     return proctor.accept(user);
   });
 
   // -------------------------------------------------------------------------
   // Auth
   // -------------------------------------------------------------------------
-  app.post(
-    '/api/auth/login',
-    loginLimiter,
-    async (c) => {
-      const b = await body(c);
-      const email = String(b.email || '').trim().toLowerCase();
-      const password = String(b.password || '');
-      const user = email ? store.getUserByEmail(email) : undefined;
-      // Same message for "no such user" and "wrong password" — don't reveal which emails exist
-      if (!user || !(await verifyPassword(password, user.passwordHash))) {
-        return c.json({ error: 'არასწორი ელ-ფოსტა ან პაროლი / Invalid email or password' }, 401);
-      }
-      // Upgrade hashes imported from the old Node server to the Workers-native format
-      if (isLegacyHash(user.passwordHash)) await store.setPassword(user.email, password, user.isTemporaryPassword);
-      store.touchLogin(user);
-      return c.json({
-        success: true,
-        token: await signToken(user, config),
-        user: publicUser(user),
-        student: user.role === 'student' ? store.getStudentByEmail(user.email) || null : null,
-        requiresPasswordChange: Boolean(user.isTemporaryPassword),
-      });
+  /** Successful sign-in: same response for every method. */
+  async function sessionResponse(c: Context<AppEnv>, user: UserAccount) {
+    store.touchLogin(user);
+    return c.json({
+      success: true,
+      token: await signToken(user, config),
+      user: { ...publicUser(user), role: roleFor(user.email, config), isTemporaryPassword: false },
+      student: roleFor(user.email, config) === 'student' ? store.getStudentByEmail(user.email) || null : null,
+      requiresPasswordChange: false,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Passwordless sign-in: email → 6-digit code (10 min, single use, 5 tries) → session
+  // -------------------------------------------------------------------------
+  const OTP_TTL_MS = 10 * 60_000;
+  const OTP_RESEND_COOLDOWN_MS = 60_000;
+  const OTP_MAX_ATTEMPTS = 5;
+
+  /** Creates (or replaces) the user's code and emails it. Returns the code only to internal callers. */
+  async function issueOtp(user: UserAccount) {
+    const code = generateOtp();
+    store.putOtp(user.email, await hashOtp(user.email, code, config.jwtSecret), OTP_TTL_MS);
+    const emailed = await mailer.sendOtp({ to: user.email, name: user.name, code, minutes: OTP_TTL_MS / 60_000 });
+    return { code, emailed };
+  }
+
+  app.post('/api/auth/otp/request', otpRequestLimiter, async (c) => {
+    const email = String((await body(c))?.email || '').trim().toLowerCase();
+    if (!/^\S+@\S+\.\S+$/.test(email)) return c.json({ error: 'შეიყვანეთ სწორი ელ-ფოსტა / Enter a valid email' }, 400);
+    const generic = { success: true, expiresInSeconds: OTP_TTL_MS / 1000, resendAfterSeconds: OTP_RESEND_COOLDOWN_MS / 1000 };
+    // No self-registration: only accounts the admin created can sign in
+    const user = store.getUserByEmail(email);
+    if (!user) return c.json({ error: 'თქვენი ელფოსტა არ მოიძებნა ბაზაში. მიმართეთ ადმინისტრატორს.', code: 'email_not_found' }, 404);
+
+    const pending = store.getOtp(email);
+    if (pending && Date.now() - pending.createdAt < OTP_RESEND_COOLDOWN_MS) {
+      const wait = Math.ceil((OTP_RESEND_COOLDOWN_MS - (Date.now() - pending.createdAt)) / 1000);
+      c.header('Retry-After', String(wait));
+      return c.json({ error: `ახალი კოდის მოთხოვნა შეგიძლიათ ${wait} წამში / You can request a new code in ${wait}s`, retryAfterSeconds: wait }, 429);
     }
-  );
+
+    const { emailed } = await issueOtp(user);
+    if (!emailed) {
+      // The code exists but couldn't be delivered (e.g. Resend not set up for this address).
+      // The administrator can issue a sign-in code from the dashboard instead.
+      return c.json(
+        { error: 'კოდის გაგზავნა ვერ მოხერხდა. შესვლის კოდისთვის მიმართეთ ადმინისტრატორს. / The code could not be emailed. Ask the administrator for a sign-in code.' },
+        502
+      );
+    }
+    return c.json(generic);
+  });
+
+  app.post('/api/auth/otp/verify', otpVerifyLimiter, async (c) => {
+    const b = await body(c);
+    const email = String(b?.email || '').trim().toLowerCase();
+    const code = String(b?.code || '').replace(/\D/g, '');
+    const invalid = () => c.json({ error: 'კოდი არასწორია ან ვადა გაუვიდა / The code is wrong or has expired' }, 400);
+    if (!email || code.length !== 6) return invalid();
+
+    const pending = store.getOtp(email);
+    const user = store.getUserByEmail(email);
+    if (!pending || !user) return invalid();
+    if (Date.now() > pending.expiresAt) {
+      store.deleteOtp(email);
+      return invalid();
+    }
+    if (!otpMatches(pending.codeHash, await hashOtp(email, code, config.jwtSecret))) {
+      if (store.bumpOtpAttempts(email) >= OTP_MAX_ATTEMPTS) {
+        store.deleteOtp(email);
+        return c.json({ error: 'ძალიან ბევრი მცდელობა. მოითხოვეთ ახალი კოდი. / Too many attempts. Request a new code.' }, 429);
+      }
+      return invalid();
+    }
+
+    store.deleteOtp(email); // single use
+    if (user.role === 'student' && user.isTemporaryPassword) {
+      user.isTemporaryPassword = false; // accounts from the password era
+      store.save('users', user);
+    }
+    return sessionResponse(c, user);
+  });
 
   app.get('/api/auth/me', requireAuth, (c) => {
     const user = store.getUserById(c.get('user').sub);
     if (!user) return c.json({ error: 'Account no longer exists' }, 401);
+    const role = roleFor(user.email, config);
     return c.json({
-      user: publicUser(user),
-      student: user.role === 'student' ? store.getStudentByEmail(user.email) || null : null,
+      user: { ...publicUser(user), role, isTemporaryPassword: false },
+      student: role === 'student' ? store.getStudentByEmail(user.email) || null : null,
     });
-  });
-
-  app.post('/api/auth/change-password', requireAuth, async (c) => {
-    const user = store.getUserById(c.get('user').sub);
-    if (!user) return c.json({ error: 'User not found' }, 404);
-    const { currentPassword, newPassword } = await body(c);
-    if (!newPassword || String(newPassword).length < 8) {
-      return c.json({ error: 'ახალი პაროლი მინიმუმ 8 სიმბოლო უნდა იყოს / New password must be at least 8 characters' }, 400);
-    }
-    // Current password is required unless the user is on a first-login temporary password
-    if (!user.isTemporaryPassword || currentPassword) {
-      if (!(await verifyPassword(String(currentPassword || ''), user.passwordHash))) {
-        // 400, not 401: the frontend treats any 401 as an expired session and logs the user out
-        return c.json({ error: 'მიმდინარე პაროლი არასწორია / Current password is incorrect' }, 400);
-      }
-    }
-    const updated = (await store.setPassword(user.email, String(newPassword), false))!;
-    return c.json({ success: true, user: publicUser(updated), token: await signToken(updated, config) });
   });
 
   app.get('/api/auth/users', requireAdmin, (c) => c.json(store.getUsers().map(publicUser)));
@@ -234,50 +285,133 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   // -------------------------------------------------------------------------
   // Students (admin)
   // -------------------------------------------------------------------------
-  app.get('/api/students', requireAdmin, (c) => c.json(store.getStudents()));
+  /** Students plus their sign-in status: `lastLoginAt` null = invited but never signed in ("Pending"). */
+  app.get('/api/students', requireAdmin, (c) =>
+    c.json(
+      store.getStudents().map((s) => {
+        const u = store.getUserByEmail(s.email);
+        return { ...s, firstLoginAt: u?.firstLoginAt || u?.lastLoginAt || null, lastLoginAt: u?.lastLoginAt || null, hasLoggedIn: Boolean(u?.lastLoginAt) };
+      })
+    )
+  );
 
-  async function createStudent(name: string, email: string, department?: string) {
-    const tempPassword = generateTempPassword();
-    const { student, created } = await store.addStudent(
-      { name, email, department: department || 'ინოვაციური მეწარმეობა და სტარტაპები' },
-      tempPassword
-    );
-    let emailed = false;
-    if (created) emailed = await mailer.sendWelcome({ to: student.email, name: student.name, temporaryPassword: tempPassword });
-    // If email isn't configured/failed, return the password ONCE so the lecturer can hand it over.
-    return { student, created, emailed, temporaryPassword: created && !emailed ? tempPassword : undefined };
+  const DEFAULT_DEPARTMENT = 'მეწარმეობა და ინოვაციები';
+  const EMAIL_RE = /^[^\s@,;<>()]+@[^\s@,;<>()]+\.[^\s@,;<>()]+$/;
+
+  /** "giorgi.beridze_2@btu.edu.ge" → "Giorgi Beridze" (the lecturer can edit it later). */
+  const nameFromEmail = (email: string) =>
+    email
+      .split('@')[0]
+      .replace(/[0-9]+/g, ' ')
+      .split(/[._\-+\s]+/)
+      .filter(Boolean)
+      .map((w) => w[0].toUpperCase() + w.slice(1).toLowerCase())
+      .join(' ') || email.split('@')[0];
+
+  /**
+   * Creates the accounts (synchronously, in one go) and then sends all invitations in Resend
+   * batches. There are no passwords: invited students sign in with an emailed code.
+   */
+  async function inviteStudents(entries: { name?: string; email: string; department?: string }[]) {
+    const results: { email: string; name: string; status: 'created' | 'exists'; invited: boolean }[] = [];
+    const toInvite: { to: string; name: string }[] = [];
+    for (const e of entries) {
+      if (e.email === config.adminEmail) {
+        results.push({ email: e.email, name: config.adminName, status: 'exists', invited: false });
+        continue; // the administrator is never a student
+      }
+      const name = (e.name || '').trim() || nameFromEmail(e.email);
+      const { student, created } = store.addStudent({ name, email: e.email, department: e.department || DEFAULT_DEPARTMENT });
+      results.push({ email: student.email, name: student.name, status: created ? 'created' : 'exists', invited: false });
+      if (created) toInvite.push({ to: student.email, name: student.name });
+    }
+    const delivered = new Set(toInvite.length ? await mailer.sendInvites(toInvite) : []);
+    for (const r of results) r.invited = delivered.has(r.email);
+    return results;
   }
 
   app.post('/api/students', requireAdmin, async (c) => {
-    const { name, email, department } = await body(c);
-    if (!name || !email || !/^\S+@\S+\.\S+$/.test(email)) {
+    const { name, email, department, digestSubscribed } = await body(c);
+    if (!name || !email || !EMAIL_RE.test(String(email).trim())) {
       return c.json({ error: 'Valid name and email are required' }, 400);
     }
-    const result = await createStudent(String(name), String(email), department);
+    if (String(email).trim().toLowerCase() === config.adminEmail) return c.json({ error: 'This is the administrator’s email' }, 400);
+    const [r] = await inviteStudents([{ name: String(name), email: String(email).trim().toLowerCase(), department }]);
+    const student = store.getStudentByEmail(r.email)!;
+    if (r.status === 'created' && digestSubscribed === false) store.updateStudentSubscription(student.email, false);
     // keep backwards compatibility: frontend expects the student object at top level
-    return c.json({ ...result.student, _meta: { created: result.created, emailed: result.emailed, temporaryPassword: result.temporaryPassword } });
+    return c.json({ ...student, _meta: { created: r.status === 'created', emailed: r.invited } });
   });
 
-  /** Bulk import: [{ name, email }] — e.g. pasted from the BTU class list */
+  /**
+   * Bulk invite: paste emails separated by commas, semicolons, spaces or new lines
+   * (`{ emails: "a@x.ge, b@x.ge" }` or `{ emails: [...] }`), or the older `{ students: [{ name, email }] }`.
+   */
+  app.post('/api/students/invite', requireAdmin, async (c) => {
+    const b = await body(c);
+    const raw: string[] = Array.isArray(b?.emails) ? b.emails.map(String) : String(b?.emails || '').split(/[\s,;]+/);
+    const seen = new Set<string>();
+    const valid: string[] = [];
+    const invalid: string[] = [];
+    for (const item of raw) {
+      // accept "Name <email>" as pasted from mail clients
+      const email = (/<([^>]+)>/.exec(item)?.[1] || item).trim().replace(/^mailto:/i, '').toLowerCase();
+      if (!email || !email.includes('@')) continue; // names pasted along with "Name <email>"
+      if (!EMAIL_RE.test(email)) invalid.push(item.trim());
+      else if (!seen.has(email)) {
+        seen.add(email);
+        valid.push(email);
+      }
+    }
+    if (valid.length > 500) return c.json({ error: 'At most 500 emails per invite' }, 400);
+    const results = await inviteStudents(valid.map((email) => ({ email, department: b?.department })));
+    return c.json({
+      created: results.filter((r) => r.status === 'created').length,
+      existing: results.filter((r) => r.status === 'exists').length,
+      invited: results.filter((r) => r.invited).length,
+      invalid,
+      results,
+    });
+  });
+
   app.post('/api/students/bulk', requireAdmin, async (c) => {
     const b = await body(c);
-    const list = Array.isArray(b?.students) ? b.students : [];
-    const results: { email: string; created: boolean; emailed: boolean; temporaryPassword?: string }[] = [];
-    for (const s of list.slice(0, 500)) {
-      if (!s?.name || !s?.email) continue;
-      const r = await createStudent(String(s.name), String(s.email), s.department);
-      results.push({ email: r.student.email, created: r.created, emailed: r.emailed, temporaryPassword: r.temporaryPassword });
-    }
+    const list = (Array.isArray(b?.students) ? b.students : []).filter((s: any) => s?.email && EMAIL_RE.test(String(s.email).trim()));
+    const results = await inviteStudents(
+      list.slice(0, 500).map((s: any) => ({ name: s.name ? String(s.name) : undefined, email: String(s.email).trim().toLowerCase(), department: s.department }))
+    );
     return c.json({ count: results.length, results });
   });
 
-  app.post('/api/students/:email/reset-password', requireAdmin, async (c) => {
+  /**
+   * Lecturer fallback when a student's code email can't be delivered: issues a fresh sign-in code,
+   * tries to email it, and shows it to the lecturer to pass on if the email didn't go out.
+   */
+  app.post('/api/students/:email/login-code', requireAdmin, async (c) => {
     const user = store.getUserByEmail(c.req.param('email'));
     if (!user || user.role !== 'student') return c.json({ error: 'Student not found' }, 404);
-    const temp = generateTempPassword();
-    await store.setPassword(user.email, temp, true);
-    const emailed = await mailer.sendWelcome({ to: user.email, name: user.name, temporaryPassword: temp });
-    return c.json({ success: true, emailed, temporaryPassword: emailed ? undefined : temp });
+    const { code, emailed } = await issueOtp(user);
+    return c.json({ success: true, emailed, expiresInSeconds: OTP_TTL_MS / 1000, code: emailed ? undefined : code });
+  });
+
+  /** Lecturer edits a student's details. Changing the email also moves their login and records. */
+  app.patch('/api/students/:email', requireAdmin, async (c) => {
+    const b = await body(c);
+    const updates: { name?: string; email?: string; department?: string; digestSubscribed?: boolean } = {};
+    if (b.name !== undefined) {
+      if (!String(b.name).trim()) return c.json({ error: 'Name cannot be empty' }, 400);
+      updates.name = String(b.name).trim().slice(0, 200);
+    }
+    if (b.email !== undefined) {
+      if (!/^\S+@\S+\.\S+$/.test(String(b.email).trim())) return c.json({ error: 'Valid email is required' }, 400);
+      updates.email = String(b.email).trim().toLowerCase();
+    }
+    if (b.department !== undefined) updates.department = String(b.department).trim().slice(0, 200);
+    if (b.digestSubscribed !== undefined) updates.digestSubscribed = Boolean(b.digestSubscribed);
+    const result = store.updateStudent(c.req.param('email'), updates);
+    if (result === 'not_found') return c.json({ error: 'Student not found' }, 404);
+    if (result === 'email_taken') return c.json({ error: 'ეს ელ-ფოსტა უკვე გამოიყენება / This email is already in use' }, 409);
+    return c.json(result);
   });
 
   app.delete('/api/students/:email', requireAdmin, (c) => {
@@ -319,6 +453,61 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     return c.json({ success: true });
   });
 
+  /**
+   * Bulk upload of course materials: several files (PDF, DOCX, TXT, MD) and/or pasted text in one
+   * multipart request (fields `files`, `text`, `textTitle`, `subject`). Each one is extracted and
+   * saved straight into the knowledge base the AI answers from. Very large texts are split into
+   * numbered parts, because one stored record must stay well under the Durable Object's 2 MB limit.
+   */
+  app.post('/api/knowledge/bulk', requireAdmin, async (c) => {
+    const form = await c.req.parseBody({ all: true });
+    const files = ([] as unknown[]).concat(form['files'] ?? []).filter((f): f is File => f instanceof File);
+    const pasted = String(form['text'] ?? '').trim();
+    if (!files.length && !pasted) return c.json({ error: 'Add at least one file or some text' }, 400);
+    if (files.length > 20) return c.json({ error: 'At most 20 files per upload' }, 400);
+    const subject = String(form['subject'] ?? '').trim() || 'მეწარმეობა და ინოვაციები';
+    const by = c.get('user').name;
+    const PART = 400_000; // characters; Georgian is 3 bytes per character in UTF-8
+
+    const save = (title: string, text: string, source: string) => {
+      const clean = text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+      const parts = Math.ceil(clean.length / PART);
+      const ids: string[] = [];
+      for (let i = 0; i < parts; i++) {
+        const content = clean.slice(i * PART, (i + 1) * PART);
+        const doc = store.addKnowledgeDoc({
+          title: parts > 1 ? `${title} (${i + 1}/${parts})` : title,
+          subject,
+          tags: [source],
+          content,
+          summary: content.replace(/\s+/g, ' ').slice(0, 200) + (content.length > 200 ? '…' : ''),
+          lastUpdatedBy: by,
+        });
+        ids.push(doc.id);
+      }
+      return ids;
+    };
+
+    const results: { name: string; ok: boolean; characters?: number; parts?: number; error?: string }[] = [];
+    for (const file of files) {
+      try {
+        if (file.size > 25 * 1024 * 1024) throw new Error('File is larger than 25 MB');
+        const text = await extractTextFromFile(new Uint8Array(await file.arrayBuffer()), file.name, file.type);
+        if (!text.trim()) throw new Error('No text found (scanned PDF? run OCR first)');
+        const ids = save(file.name.replace(/\.[^.]+$/, ''), text, 'file');
+        results.push({ name: file.name, ok: true, characters: text.length, parts: ids.length });
+      } catch (err: any) {
+        results.push({ name: file.name, ok: false, error: String(err?.message || err).slice(0, 200) });
+      }
+    }
+    if (pasted) {
+      const title = String(form['textTitle'] ?? '').trim() || `ტექსტი ${new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Tbilisi' })}`;
+      const ids = save(title, pasted, 'text');
+      results.push({ name: title, ok: true, characters: pasted.length, parts: ids.length });
+    }
+    return c.json({ saved: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results });
+  });
+
   /** Upload PDF / DOCX / TXT / MD → returns extracted text for the lecturer to review & save. */
   app.post('/api/knowledge/extract', requireAdmin, async (c) => {
     const form = await c.req.parseBody();
@@ -357,8 +546,9 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
 
   function validateQuestions(questions: unknown): string | null {
     if (!Array.isArray(questions) || questions.length === 0) return 'At least one question is required';
-    const total = questions.reduce((acc: number, q: any) => acc + (Number(q?.points) || 0), 0);
-    if (total > 100) return `Total points cannot exceed 100 (currently ${total}).`;
+    if (questions.some((q: any) => !(Number(q?.points) > 0))) return 'Every question needs a positive number of points';
+    const total = roundPts(questions.reduce((acc: number, q: any) => acc + Number(q.points), 0));
+    if (total > MAX_TEST_POINTS) return `Total points cannot exceed ${MAX_TEST_POINTS} (currently ${total}).`;
     return null;
   }
 
@@ -375,7 +565,7 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
       instructions: String(b.instructions || ''),
       durationMinutes: Number(b.durationMinutes) || 30,
       passingScore: Number(b.passingScore) || 51,
-      totalPoints: questions.reduce((acc, q) => acc + (Number(q.points) || 0), 0),
+      totalPoints: roundPts(questions.reduce((acc, q) => acc + (Number(q.points) || 0), 0)),
       startTime: b.startTime || new Date().toISOString(),
       endTime: b.endTime || new Date(Date.now() + 7 * 86_400_000).toISOString(),
       status: ['draft', 'upcoming', 'active', 'closed'].includes(b.status) ? b.status : 'active',
@@ -558,7 +748,7 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     const grading: Record<string, QuestionGrading> = {};
     for (const q of test.questions) {
       const g = input[q.id] || {};
-      const points = Math.min(q.points, Math.max(0, Number(g.earnedPoints) || 0));
+      const points = roundPts(Math.min(q.points, Math.max(0, Number(g.earnedPoints) || 0)));
       grading[q.id] = {
         questionId: q.id,
         earnedPoints: points,
@@ -568,7 +758,7 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
         autoGradedBy: 'proctor_manual',
       };
     }
-    const totalScore = Object.values(grading).reduce((n, g) => n + g.earnedPoints, 0);
+    const totalScore = roundPts(Object.values(grading).reduce((n, g) => n + g.earnedPoints, 0));
     return c.json(store.updateSubmissionGrading(sub.id, grading, totalScore, test.passingScore));
   };
   app.post('/api/submissions/:id/manual-grade', requireAdmin, applyManualGrade);
@@ -584,17 +774,17 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   });
 
   // -------------------------------------------------------------------------
-  // AI teaching agent (OpenRouter)
+  // AI teaching agent (Gemini, silent fallback to OpenRouter)
   // -------------------------------------------------------------------------
-  app.get('/api/ai/models', requireAuth, (c) => c.json(availableModels(config)));
+  app.get('/api/ai/status', requireAuth, (c) => c.json(aiStatus(config)));
+  app.get('/api/ai/models', requireAuth, (c) => c.json(aiStatus(config))); // old frontends
 
   const chatHandler = async (c: Context<AppEnv>) => {
     const b = await body(c);
     const { message, language } = b || {};
     const history = b?.history || b?.conversationHistory || [];
     if (!message || typeof message !== 'string') return c.json({ error: 'Message is required' }, 400);
-    // Only models from the server's allow-list — the client can't route to arbitrary (paid) models
-    const model = config.openrouter.chatModels.includes(b?.model) ? b.model : undefined;
+    // Routing is server-side only: any `model` sent by the client is ignored
     try {
       const result = await chatWithTeachingAgent(config, {
         message,
@@ -606,7 +796,6 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
         knowledgeDocs: store.getKnowledgeDocs(),
         language: language === 'en' ? 'en' : 'ka',
         studentName: c.get('user').name,
-        model,
       });
       return c.json(result);
     } catch (err: any) {
@@ -625,13 +814,20 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   app.get('/api/cron/digests', requireAuth, (c) => {
     const digests = store.getDigests().slice(0, 60);
     if (c.get('user').role === 'admin') return c.json(digests);
-    return c.json(digests.map(({ recipients, ...d }) => ({ ...d, recipients: [] })));
+    return c.json(digests.map(({ recipients, emailHtml, ...d }) => ({ ...d, recipients: [], emailHtml: '' })));
   });
 
   app.post('/api/cron/trigger', requireAdmin, async (c) => {
     try {
       const { subjectFocus, language } = await body(c);
       const result = await digest.run(subjectFocus || undefined, language === 'en' ? 'en' : 'ka');
+      if (!result) {
+        return c.json({
+          success: true,
+          digest: null,
+          message: 'ახალი ინფორმაცია არ არის — დაიჯესტი არ შეიქმნა / Nothing new since the last digest — nothing was created or sent.',
+        });
+      }
       return c.json({ success: true, digest: result });
     } catch (err: any) {
       return c.json({ error: err.message || 'Failed generating digest' }, 500);

@@ -1,5 +1,4 @@
 import { sign, verify } from 'hono/jwt';
-import { scrypt } from '@noble/hashes/scrypt.js';
 import type { Config } from './config';
 import type { Role, UserAccount } from './types';
 
@@ -29,46 +28,25 @@ function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
   return diff === 0;
 }
 
-// ---------- Password hashing ----------
-// New hashes use PBKDF2-SHA256 via WebCrypto (100k iterations is the Workers maximum).
-// Hashes from the old Node server (scrypt$salt$hash) still verify, and are upgraded on login.
+// ---------- One-time sign-in codes ----------
 
-const PBKDF2_ITERATIONS = 100_000;
-
-async function pbkdf2(password: string, salt: Uint8Array, iterations: number): Promise<Uint8Array> {
-  const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, key, 256);
-  return new Uint8Array(bits);
+/** 6-digit code, uniformly random (leading zeros allowed). */
+export function generateOtp(): string {
+  return String(randomInt(1_000_000)).padStart(6, '0');
 }
 
-export async function hashPassword(password: string): Promise<string> {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const hash = await pbkdf2(password, salt, PBKDF2_ITERATIONS);
-  return `pbkdf2$${PBKDF2_ITERATIONS}$${toHex(salt)}$${toHex(hash)}`;
+/**
+ * HMAC-SHA256(secret, email:code). Only this hash is stored, so a database leak doesn't reveal
+ * live codes, and the 10^6 code space can't be brute-forced offline without the server secret.
+ */
+export async function hashOtp(email: string, code: string, secret: string): Promise<string> {
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const mac = await crypto.subtle.sign('HMAC', key, enc.encode(`${email.trim().toLowerCase()}:${code}`));
+  return toHex(new Uint8Array(mac));
 }
 
-export async function verifyPassword(password: string, stored: string | undefined): Promise<boolean> {
-  if (!stored) return false;
-  const parts = stored.split('$');
-  if (parts[0] === 'pbkdf2' && parts.length === 4) {
-    const candidate = await pbkdf2(password, fromHex(parts[2]), Number(parts[1]));
-    return timingSafeEqual(candidate, fromHex(parts[3]));
-  }
-  if (parts[0] === 'scrypt' && parts.length === 3) {
-    // Node's crypto.scryptSync defaults: N=16384, r=8, p=1; salt was used as a utf-8 string
-    const candidate = scrypt(enc.encode(password), enc.encode(parts[1]), { N: 16384, r: 8, p: 1, dkLen: 64 });
-    return timingSafeEqual(candidate, fromHex(parts[2]));
-  }
-  return false;
-}
-
-export const isLegacyHash = (stored: string | undefined) => Boolean(stored?.startsWith('scrypt$'));
-
-/** Readable random password for first login, e.g. "Kx7p-Q2mv-9Tzd" */
-export function generateTempPassword(): string {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
-  const block = () => Array.from({ length: 4 }, () => alphabet[randomInt(alphabet.length)]).join('');
-  return `${block()}-${block()}-${block()}`;
+export function otpMatches(storedHash: string, candidateHash: string): boolean {
+  return timingSafeEqual(fromHex(storedHash), fromHex(candidateHash));
 }
 
 // ---------- Tokens ----------
@@ -80,10 +58,14 @@ export interface TokenPayload {
   name: string;
 }
 
+/** Only the configured admin email is ever an admin, whatever a stored record or old token says. */
+export const roleFor = (email: string, config: Config): Role =>
+  email.trim().toLowerCase() === config.adminEmail ? 'admin' : 'student';
+
 export async function signToken(user: UserAccount, config: Config): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   return sign(
-    { sub: user.id, email: user.email, role: user.role, name: user.name, iat: now, exp: now + config.jwtExpiresInSeconds },
+    { sub: user.id, email: user.email, role: roleFor(user.email, config), name: user.name, iat: now, exp: now + config.jwtExpiresInSeconds },
     config.jwtSecret,
     'HS256'
   );
@@ -94,13 +76,13 @@ export async function verifyToken(token: string, config: Config): Promise<TokenP
   try {
     const p = await verify(token, config.jwtSecret, 'HS256');
     if (typeof p.sub !== 'string' || typeof p.email !== 'string') return null;
-    return { sub: p.sub, email: p.email, role: p.role as Role, name: String(p.name || '') };
+    return { sub: p.sub, email: p.email, role: roleFor(p.email, config), name: String(p.name || '') };
   } catch {
     return null;
   }
 }
 
-/** Strip every secret field before sending a user to the client. */
+/** Strip every secret field (including legacy password hashes) before sending a user to the client. */
 export function publicUser(user: UserAccount): Omit<UserAccount, 'passwordHash' | 'temporaryPassword'> {
   const { passwordHash, temporaryPassword, ...safe } = user;
   return safe;

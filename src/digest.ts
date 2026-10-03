@@ -1,7 +1,7 @@
 import type { Store } from './store';
 import { APP_NAME, type Config } from './config';
 import { writeDigestFromNews, type DigestContent } from './ai';
-import { collectNews } from './news';
+import { collectNews, newsKey, titleKey } from './news';
 import { escapeHtml, type Mailer } from './mailer';
 import type { DailyDigest } from './types';
 
@@ -43,6 +43,7 @@ export class DigestService {
   private isRunning = false;
   private lastRunAt: string | null = null;
   private lastError: string | null = null;
+  private lastOutcome: string | null = null;
 
   constructor(
     private store: Store,
@@ -59,18 +60,61 @@ export class DigestService {
   async runScheduled() {
     if (!this.config.digest.enabled) return;
     if (this.store.getDigests().some((d) => d.date === this.todayInTz())) return;
-    await this.run().catch((e) => console.error('Scheduled digest failed:', e.message));
+    // Only the daily schedule emails subscribers (and only if DIGEST_EMAIL isn't "false")
+    await this.run(undefined, 'ka', { sendEmail: this.config.digest.emailEnabled }).catch((e) =>
+      console.error('Scheduled digest failed:', e.message)
+    );
   }
 
-  async run(subjectFocus = DEFAULT_FOCUS, language: 'en' | 'ka' = 'ka'): Promise<DailyDigest> {
+  /**
+   * Builds and sends a digest from news that is NEW since the previous digest. Returns null (and
+   * sends nothing) when there's nothing new or nothing relevant — no repeats, no filler.
+   */
+  async run(
+    subjectFocus = DEFAULT_FOCUS,
+    language: 'en' | 'ka' = 'ka',
+    { sendEmail = false }: { sendEmail?: boolean } = {}
+  ): Promise<DailyDigest | null> {
     if (this.isRunning) throw new Error('Digest generation is already in progress.');
     this.isRunning = true;
     try {
-      // 1. real news from free RSS feeds  2. a free model writes the summaries
-      const { items, failedFeeds } = await collectNews(this.config.digest.feeds);
+      const previous = this.store.getDigests();
+      // Window: since the last digest, but never more than 36 hours back
+      const lastAt = Date.parse(previous[0]?.generatedAt || '');
+      const since = new Date(Math.max(Number.isFinite(lastAt) ? lastAt : 0, Date.now() - 36 * 3600_000));
+      const seenUrls = new Set<string>();
+      const seenTitles = new Set<string>();
+      for (const d of previous.slice(0, 90)) {
+        for (const a of d.keyArticles || []) {
+          if (a.url) seenUrls.add(newsKey(a.url));
+          if (a.title) seenTitles.add(titleKey(a.title));
+        }
+      }
+
+      // 1. new items from free RSS feeds  2. the AI picks the relevant ones and writes the summaries
+      const { items, failedFeeds } = await collectNews(this.config.digest.feeds, { since, seenUrls, seenTitles });
       if (failedFeeds.length) console.warn('Digest feeds unavailable:', failedFeeds.join(', '));
-      if (items.length < 2) throw new Error('Not enough recent news in the RSS feeds — digest skipped.');
-      const content = await writeDigestFromNews(this.config, { items, subjectFocus, language });
+      const content = items.length
+        ? await writeDigestFromNews(this.config, {
+            items,
+            subjectFocus,
+            language,
+            recentQuestions: previous
+              .slice(0, 14)
+              .map((d) => d.challengeQuestion?.question)
+              .filter((q): q is string => Boolean(q)),
+          })
+        : null;
+
+      this.lastRunAt = new Date().toISOString();
+      this.lastError = null;
+      if (!content) {
+        this.lastOutcome = items.length ? 'nothing_relevant' : 'no_new_items';
+        console.log(`Digest skipped: ${this.lastOutcome} since ${since.toISOString()}`);
+        return null;
+      }
+      this.lastOutcome = 'created';
+
       const emailHtml = renderEmail(content, this.config);
       const subscribed = this.store.getStudents().filter((s) => s.digestSubscribed);
 
@@ -79,7 +123,10 @@ export class DigestService {
         .map((a) => `• ${a.title} (${a.source})\n  ${a.summary}\n  ${a.url || ''}`)
         .join('\n\n')}`;
 
-      const delivered = await this.mailer.sendMany(subscribed.map((s) => ({ to: s.email, subject, html: emailHtml, text })));
+      // Generating from the dashboard is in-app only: no email unless the caller asks for it
+      const delivered = sendEmail
+        ? await this.mailer.sendMany(subscribed.map((s) => ({ to: s.email, subject, html: emailHtml, text })))
+        : [];
 
       const record = this.store.addDigest({
         date: this.todayInTz(),
@@ -93,9 +140,6 @@ export class DigestService {
         recipients: delivered,
         emailHtml,
       });
-
-      this.lastRunAt = new Date().toISOString();
-      this.lastError = null;
       return record;
     } catch (err: any) {
       this.lastError = err?.message || String(err);
@@ -110,11 +154,15 @@ export class DigestService {
       isRunning: this.isRunning,
       lastRunAt: this.lastRunAt || this.store.getDigests()[0]?.generatedAt || null,
       lastError: this.lastError,
+      lastOutcome: this.lastOutcome,
+      emailOnSchedule: this.config.digest.emailEnabled,
+      today: this.todayInTz(),
+      digests: this.store.getDigests().slice(0, 60),
       enabled: this.config.digest.enabled,
       schedule: cronSchedule,
       newsSource: 'rss',
       feeds: this.config.digest.feeds,
-      aiModels: this.config.openrouter.digestModels,
+      aiModels: [...(this.config.gemini.apiKey ? this.config.gemini.models : []), ...this.config.openrouter.digestModels],
       timezone: this.config.digest.timezone,
       nextScheduledAt: `${cronSchedule} (UTC)`,
       smtpConfigured: this.mailer.isConfigured,
