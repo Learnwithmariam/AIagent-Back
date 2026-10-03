@@ -34,7 +34,33 @@ export class Mailer {
   // Kept in memory: an operational log, not a record. Resets when the Durable Object restarts.
   private auditLogs: EmailAuditLog[] = [];
 
+  private resolvedFrom: string | null = null;
+
   constructor(private config: Config) {}
+
+  /**
+   * Sender address. MAIL_FROM wins when set. Otherwise the sender is noreply@ on the first domain
+   * verified in the Resend account, so email works as soon as a domain is verified without a
+   * config change. Falls back to Resend's test sender, which only reaches the account owner.
+   */
+  private async fromAddress(): Promise<string> {
+    if (this.config.mail.from) return this.config.mail.from;
+    if (this.resolvedFrom) return this.resolvedFrom;
+    try {
+      const res = await fetch(`${RESEND_URL}/domains`, { headers: { Authorization: `Bearer ${this.config.mail.resendApiKey}` } });
+      if (!res.ok) throw new Error(`Resend ${res.status}: ${(await res.text()).slice(0, 150)}`);
+      const data: any = await res.json();
+      const domain = (Array.isArray(data?.data) ? data.data : []).find((d: any) => d?.status === 'verified')?.name;
+      if (!domain) throw new Error('no verified domain in the Resend account');
+      this.resolvedFrom = `${APP_NAME} <noreply@${domain}>`;
+      console.log(`Email sender: ${this.resolvedFrom}`);
+      return this.resolvedFrom;
+    } catch (err: any) {
+      // not cached, so a domain verified later is picked up on the next send
+      console.warn(`Could not look up a verified Resend domain (${err?.message}); set MAIL_FROM. Using the test sender.`);
+      return `${APP_NAME} <onboarding@resend.dev>`;
+    }
+  }
 
   get isConfigured() {
     return Boolean(this.config.mail.resendApiKey);
@@ -65,14 +91,15 @@ export class Mailer {
       return [];
     }
     const delivered: string[] = [];
+    const from = await this.fromAddress();
     for (let i = 0; i < emails.length; i += 100) {
       const batch = emails.slice(i, i + 100);
       try {
         await this.post(
           batch.length === 1 ? '/emails' : '/emails/batch',
           batch.length === 1
-            ? { from: this.config.mail.from, ...batch[0], to: [batch[0].to] }
-            : batch.map((e) => ({ from: this.config.mail.from, ...e, to: [e.to] }))
+            ? { from, ...batch[0], to: [batch[0].to] }
+            : batch.map((e) => ({ from, ...e, to: [e.to] }))
         );
         for (const e of batch) {
           delivered.push(e.to);

@@ -100,7 +100,8 @@ export function buildConfig(env: Env) {
 
     mail: {
       resendApiKey: env.RESEND_API_KEY || '',
-      from: env.MAIL_FROM || `${APP_NAME} <noreply@example.com>`,
+      /** Empty = send from noreply@<the Resend account's verified domain>, looked up at runtime */
+      from: (env.MAIL_FROM || '').trim(),
     },
 
     digest: {

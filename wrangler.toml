@@ -41,7 +41,8 @@ OPENROUTER_DIGEST_MODEL = ""
 # Free public RSS/Atom feeds for the daily digest (comma-separated). Empty = built-in list
 # (TechCrunch Startups, Crunchbase News, Sifted, EU-Startups, VentureBeat).
 DIGEST_FEEDS = ""
-MAIL_FROM = "G.K. BTU Students <onboarding@resend.dev>"
+# Empty = noreply@<your verified Resend domain>, detected automatically. Or set e.g. "G.K. BTU Students <noreply@example.ge>"
+MAIL_FROM = ""
 DIGEST_ENABLED = "true"
 # "false" = the daily 08:00 digest stays in-app only (no email). Generating from the dashboard never emails.
 DIGEST_EMAIL = "true"
