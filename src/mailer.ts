@@ -45,6 +45,9 @@ class ProviderError extends Error {
   }
 }
 
+/** "giorgi.k@btu.edu.ge" → "gi***@btu.edu.ge" for logs */
+const maskEmail = (email: string) => email.replace(/^(.{2}).*(@.*)$/, '$1***$2');
+
 /** "Name <addr@x>" → { name, email } */
 function parseAddress(from: string): { name?: string; email: string } {
   const m = /^\s*(.*?)\s*<([^>]+)>\s*$/.exec(from);
@@ -114,6 +117,9 @@ export class Mailer {
       signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) throw new ProviderError(`Brevo ${res.status}: ${(await res.text()).slice(0, 200)}`, res.status);
+    const data: any = await res.json().catch(() => ({}));
+    // The message id lets you find this exact email in Brevo → Transactional → Logs
+    console.log(`Email accepted by Brevo for ${maskEmail(e.to)} (messageId ${data?.messageId || 'n/a'})`);
   }
 
   /** Tries Brevo for each email; returns the ones Brevo did not deliver. */
@@ -158,6 +164,9 @@ export class Mailer {
       signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) throw new ProviderError(`Resend ${res.status}: ${(await res.text()).slice(0, 200)}`, res.status);
+    const data: any = await res.json().catch(() => ({}));
+    const ids = Array.isArray(data?.data) ? data.data.map((x: any) => x?.id) : [data?.id];
+    console.log(`Email accepted by Resend (ids ${ids.filter(Boolean).join(', ') || 'n/a'})`);
   }
 
   /** Sends in batches of 100 (Resend's batch limit). */
