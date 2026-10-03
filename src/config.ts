@@ -9,7 +9,6 @@ export interface Env {
 
   // secrets
   JWT_SECRET?: string;
-  ADMIN_PASSWORD?: string;
   GEMINI_API_KEY?: string;
   OPENROUTER_API_KEY?: string;
   RESEND_API_KEY?: string;
@@ -34,6 +33,9 @@ export interface Env {
 }
 
 export const APP_NAME = 'G.K. BTU Students';
+
+/** The one and only administrator. ADMIN_EMAIL can override it, but there is never more than one. */
+export const DEFAULT_ADMIN_EMAIL = 'giorgi.khatiashvili@btu.edu.ge';
 
 /**
  * Free OpenRouter models tried in order when OPENROUTER_MODELS isn't set.
@@ -78,10 +80,9 @@ export function buildConfig(env: Env) {
     jwtSecret: env.JWT_SECRET || 'dev-only-insecure-secret-change-me',
     jwtExpiresInSeconds: parseDuration(env.JWT_EXPIRES_IN, 12 * 3600),
 
-    /** Bootstrap admin — created on first start only if no admin exists. */
-    adminEmail: (env.ADMIN_EMAIL || '').trim().toLowerCase(),
+    /** The single administrator. Admin rights come from this email alone, never from stored roles. */
+    adminEmail: (env.ADMIN_EMAIL || DEFAULT_ADMIN_EMAIL).trim().toLowerCase(),
     adminName: env.ADMIN_NAME || 'Prof. Giorgi Khatiashvili',
-    adminPassword: env.ADMIN_PASSWORD || '',
 
     /** Primary AI provider for the chat (and digest). Falls back to OpenRouter silently. */
     gemini: {

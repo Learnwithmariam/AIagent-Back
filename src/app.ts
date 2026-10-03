@@ -8,7 +8,7 @@ import type { Mailer } from './mailer';
 import type { DigestService } from './digest';
 import { aiStatus, chatWithTeachingAgent } from './ai';
 import { extractTextFromFile } from './extract';
-import { signToken, verifyToken, verifyPassword, isLegacyHash, publicUser, generateOtp, hashOtp, otpMatches, type TokenPayload } from './auth';
+import { signToken, verifyToken, publicUser, generateOtp, hashOtp, otpMatches, roleFor, type TokenPayload } from './auth';
 import { MAX_TEST_POINTS, type UserAccount, type Question, type QuestionGrading, type Test, type TestSubmission, type ProctorSummary } from './types';
 
 export interface Deps {
@@ -80,7 +80,6 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   const clientIp = (c: Context) => c.req.header('CF-Connecting-IP') || 'anon';
   // Hono caches the parsed body, so reading it here doesn't consume it for the handler
   const emailKey = async (c: Context<AppEnv>) => `${clientIp(c)}|${String((await body(c))?.email || '').trim().toLowerCase()}`;
-  const loginLimiter = rateLimit(15 * 60_000, 10, emailKey);
   // Sign-in codes: at most 5 code emails and 10 verification tries per IP + email per 15 minutes
   const otpRequestLimiter = rateLimit(15 * 60_000, 5, emailKey);
   const otpVerifyLimiter = rateLimit(15 * 60_000, 10, emailKey);
@@ -189,9 +188,9 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     return c.json({
       success: true,
       token: await signToken(user, config),
-      user: publicUser(user),
-      student: user.role === 'student' ? store.getStudentByEmail(user.email) || null : null,
-      requiresPasswordChange: user.role === 'admin' && Boolean(user.isTemporaryPassword),
+      user: { ...publicUser(user), role: roleFor(user.email, config), isTemporaryPassword: false },
+      student: roleFor(user.email, config) === 'student' ? store.getStudentByEmail(user.email) || null : null,
+      requiresPasswordChange: false,
     });
   }
 
@@ -214,9 +213,9 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     const email = String((await body(c))?.email || '').trim().toLowerCase();
     if (!/^\S+@\S+\.\S+$/.test(email)) return c.json({ error: 'შეიყვანეთ სწორი ელ-ფოსტა / Enter a valid email' }, 400);
     const generic = { success: true, expiresInSeconds: OTP_TTL_MS / 1000, resendAfterSeconds: OTP_RESEND_COOLDOWN_MS / 1000 };
+    // No self-registration: only accounts the admin created can sign in
     const user = store.getUserByEmail(email);
-    // Unknown emails get the same answer, so the form doesn't reveal who is enrolled
-    if (!user) return c.json(generic);
+    if (!user) return c.json({ error: 'თქვენი ელფოსტა არ მოიძებნა ბაზაში. მიმართეთ ადმინისტრატორს.', code: 'email_not_found' }, 404);
 
     const pending = store.getOtp(email);
     if (pending && Date.now() - pending.createdAt < OTP_RESEND_COOLDOWN_MS) {
@@ -228,9 +227,9 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     const { emailed } = await issueOtp(user);
     if (!emailed) {
       // The code exists but couldn't be delivered (e.g. Resend not set up for this address).
-      // The lecturer can read a sign-in code from the dashboard instead.
+      // The administrator can issue a sign-in code from the dashboard instead.
       return c.json(
-        { error: 'კოდის გაგზავნა ვერ მოხერხდა. სთხოვეთ ლექტორს შესვლის კოდი. / The code could not be emailed. Ask your lecturer for a sign-in code.' },
+        { error: 'კოდის გაგზავნა ვერ მოხერხდა. შესვლის კოდისთვის მიმართეთ ადმინისტრატორს. / The code could not be emailed. Ask the administrator for a sign-in code.' },
         502
       );
     }
@@ -267,46 +266,14 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     return sessionResponse(c, user);
   });
 
-  /** Lecturer's emergency sign-in with a password. Students have no passwords and use codes. */
-  app.post('/api/auth/login', loginLimiter, async (c) => {
-    const b = await body(c);
-    const email = String(b.email || '').trim().toLowerCase();
-    const password = String(b.password || '');
-    const user = email ? store.getUserByEmail(email) : undefined;
-    // Same message for "no such user", "not the lecturer" and "wrong password"
-    if (!user || user.role !== 'admin' || !(await verifyPassword(password, user.passwordHash))) {
-      return c.json({ error: 'არასწორი ელ-ფოსტა ან პაროლი / Invalid email or password' }, 401);
-    }
-    // Upgrade hashes imported from the old Node server to the Workers-native format
-    if (isLegacyHash(user.passwordHash)) await store.setPassword(user.email, password, user.isTemporaryPassword);
-    return sessionResponse(c, user);
-  });
-
   app.get('/api/auth/me', requireAuth, (c) => {
     const user = store.getUserById(c.get('user').sub);
     if (!user) return c.json({ error: 'Account no longer exists' }, 401);
+    const role = roleFor(user.email, config);
     return c.json({
-      user: publicUser(user),
-      student: user.role === 'student' ? store.getStudentByEmail(user.email) || null : null,
+      user: { ...publicUser(user), role, isTemporaryPassword: false },
+      student: role === 'student' ? store.getStudentByEmail(user.email) || null : null,
     });
-  });
-
-  app.post('/api/auth/change-password', requireAdmin, async (c) => {
-    const user = store.getUserById(c.get('user').sub);
-    if (!user) return c.json({ error: 'User not found' }, 404);
-    const { currentPassword, newPassword } = await body(c);
-    if (!newPassword || String(newPassword).length < 8) {
-      return c.json({ error: 'ახალი პაროლი მინიმუმ 8 სიმბოლო უნდა იყოს / New password must be at least 8 characters' }, 400);
-    }
-    // Current password is required unless the user is on a first-login temporary password
-    if (!user.isTemporaryPassword || currentPassword) {
-      if (!(await verifyPassword(String(currentPassword || ''), user.passwordHash))) {
-        // 400, not 401: the frontend treats any 401 as an expired session and logs the user out
-        return c.json({ error: 'მიმდინარე პაროლი არასწორია / Current password is incorrect' }, 400);
-      }
-    }
-    const updated = (await store.setPassword(user.email, String(newPassword), false))!;
-    return c.json({ success: true, user: publicUser(updated), token: await signToken(updated, config) });
   });
 
   app.get('/api/auth/users', requireAdmin, (c) => c.json(store.getUsers().map(publicUser)));
@@ -338,6 +305,10 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     const results: { email: string; name: string; status: 'created' | 'exists'; invited: boolean }[] = [];
     const toInvite: { to: string; name: string }[] = [];
     for (const e of entries) {
+      if (e.email === config.adminEmail) {
+        results.push({ email: e.email, name: config.adminName, status: 'exists', invited: false });
+        continue; // the administrator is never a student
+      }
       const name = (e.name || '').trim() || nameFromEmail(e.email);
       const { student, created } = store.addStudent({ name, email: e.email, department: e.department || DEFAULT_DEPARTMENT });
       results.push({ email: student.email, name: student.name, status: created ? 'created' : 'exists', invited: false });
@@ -353,6 +324,7 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
     if (!name || !email || !EMAIL_RE.test(String(email).trim())) {
       return c.json({ error: 'Valid name and email are required' }, 400);
     }
+    if (String(email).trim().toLowerCase() === config.adminEmail) return c.json({ error: 'This is the administrator’s email' }, 400);
     const [r] = await inviteStudents([{ name: String(name), email: String(email).trim().toLowerCase(), department }]);
     const student = store.getStudentByEmail(r.email)!;
     if (r.status === 'created' && digestSubscribed === false) store.updateStudentSubscription(student.email, false);
@@ -468,6 +440,61 @@ export function createApp({ store, proctor, mailer, digest, config, cronSchedule
   app.delete('/api/knowledge/:id', requireAdmin, (c) => {
     if (!store.deleteKnowledgeDoc(c.req.param('id'))) return c.json({ error: 'Document not found' }, 404);
     return c.json({ success: true });
+  });
+
+  /**
+   * Bulk upload of course materials: several files (PDF, DOCX, TXT, MD) and/or pasted text in one
+   * multipart request (fields `files`, `text`, `textTitle`, `subject`). Each one is extracted and
+   * saved straight into the knowledge base the AI answers from. Very large texts are split into
+   * numbered parts, because one stored record must stay well under the Durable Object's 2 MB limit.
+   */
+  app.post('/api/knowledge/bulk', requireAdmin, async (c) => {
+    const form = await c.req.parseBody({ all: true });
+    const files = ([] as unknown[]).concat(form['files'] ?? []).filter((f): f is File => f instanceof File);
+    const pasted = String(form['text'] ?? '').trim();
+    if (!files.length && !pasted) return c.json({ error: 'Add at least one file or some text' }, 400);
+    if (files.length > 20) return c.json({ error: 'At most 20 files per upload' }, 400);
+    const subject = String(form['subject'] ?? '').trim() || 'მეწარმეობა და ინოვაციები';
+    const by = c.get('user').name;
+    const PART = 400_000; // characters; Georgian is 3 bytes per character in UTF-8
+
+    const save = (title: string, text: string, source: string) => {
+      const clean = text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+      const parts = Math.ceil(clean.length / PART);
+      const ids: string[] = [];
+      for (let i = 0; i < parts; i++) {
+        const content = clean.slice(i * PART, (i + 1) * PART);
+        const doc = store.addKnowledgeDoc({
+          title: parts > 1 ? `${title} (${i + 1}/${parts})` : title,
+          subject,
+          tags: [source],
+          content,
+          summary: content.replace(/\s+/g, ' ').slice(0, 200) + (content.length > 200 ? '…' : ''),
+          lastUpdatedBy: by,
+        });
+        ids.push(doc.id);
+      }
+      return ids;
+    };
+
+    const results: { name: string; ok: boolean; characters?: number; parts?: number; error?: string }[] = [];
+    for (const file of files) {
+      try {
+        if (file.size > 25 * 1024 * 1024) throw new Error('File is larger than 25 MB');
+        const text = await extractTextFromFile(new Uint8Array(await file.arrayBuffer()), file.name, file.type);
+        if (!text.trim()) throw new Error('No text found (scanned PDF? run OCR first)');
+        const ids = save(file.name.replace(/\.[^.]+$/, ''), text, 'file');
+        results.push({ name: file.name, ok: true, characters: text.length, parts: ids.length });
+      } catch (err: any) {
+        results.push({ name: file.name, ok: false, error: String(err?.message || err).slice(0, 200) });
+      }
+    }
+    if (pasted) {
+      const title = String(form['textTitle'] ?? '').trim() || `ტექსტი ${new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Tbilisi' })}`;
+      const ids = save(title, pasted, 'text');
+      results.push({ name: title, ok: true, characters: pasted.length, parts: ids.length });
+    }
+    return c.json({ saved: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results });
   });
 
   /** Upload PDF / DOCX / TXT / MD → returns extracted text for the lecturer to review & save. */

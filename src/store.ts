@@ -12,7 +12,7 @@ import {
   type OtpRecord,
 } from './types';
 import type { Config } from './config';
-import { hashPassword, randomHex } from './auth';
+import { randomHex } from './auth';
 import { SEED_KNOWLEDGE, SEED_TESTS } from './seed';
 
 /**
@@ -78,7 +78,7 @@ export class Store {
       this.sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('seeded', '1')`);
     }
     this.migrateToTenPointScale();
-    await this.ensureAdmin();
+    this.ensureAdmin();
   }
 
   /**
@@ -178,19 +178,29 @@ export class Store {
     return gone.length;
   }
 
-  /** Creates the lecturer account from ADMIN_EMAIL / ADMIN_PASSWORD on first boot. */
-  private async ensureAdmin() {
-    if (this.data.users.some((u) => u.role === 'admin')) return;
-    if (!this.config.adminEmail || !this.config.adminPassword) {
-      console.warn('No admin account exists. Set ADMIN_EMAIL (var) and ADMIN_PASSWORD (secret) to create one.');
-      return;
+  /**
+   * Makes sure exactly one admin exists: the configured admin email. Any other account that was
+   * stored as an admin (e.g. from an old import) loses that role. No password is involved: the
+   * admin signs in with an emailed code like everyone else.
+   */
+  private ensureAdmin() {
+    for (const u of this.data.users) {
+      const shouldBeAdmin = u.email.toLowerCase() === this.config.adminEmail;
+      if (u.role === 'admin' && !shouldBeAdmin) {
+        u.role = 'student';
+        this.save('users', u);
+        console.warn(`Removed admin role from ${u.email}: only ${this.config.adminEmail} is an admin.`);
+      } else if (shouldBeAdmin && u.role !== 'admin') {
+        u.role = 'admin';
+        this.save('users', u);
+      }
     }
+    if (this.getUserByEmail(this.config.adminEmail)) return;
     this.insert('users', {
       id: newId('user-admin'),
       email: this.config.adminEmail,
       name: this.config.adminName,
       role: 'admin',
-      passwordHash: await hashPassword(this.config.adminPassword),
       isTemporaryPassword: false,
       createdAt: new Date().toISOString(),
     });
@@ -199,16 +209,14 @@ export class Store {
 
   /**
    * One-off migration: replace everything with a db.json exported from the old Node server.
-   * Legacy scrypt password hashes keep working (see auth.ts).
+   * Passwords are dropped: everyone signs in with emailed codes now.
    */
   async importLegacy(dump: Partial<Record<Name, any[]>>) {
-    // hash any plaintext prototype passwords before touching storage
     for (const u of Array.isArray(dump.users) ? dump.users : []) {
-      if (u?.temporaryPassword && !u.passwordHash) {
-        u.passwordHash = await hashPassword(String(u.temporaryPassword));
-        u.isTemporaryPassword = true; // force a change after migration
-      }
-      if (u) delete u.temporaryPassword;
+      if (!u) continue;
+      delete u.temporaryPassword;
+      delete u.passwordHash;
+      u.isTemporaryPassword = false;
     }
     this.sql.exec(`DELETE FROM records`);
     this.seq = 0;
@@ -222,6 +230,7 @@ export class Store {
       }
     }
     this.sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('seeded', '1')`);
+    this.ensureAdmin();
     // imported data may still be on the old 100-point scale
     this.sql.exec(`DELETE FROM meta WHERE key = 'points_max_10'`);
     this.migrateToTenPointScale();
@@ -245,15 +254,6 @@ export class Store {
   touchLogin(user: UserAccount) {
     user.lastLoginAt = new Date().toISOString();
     this.save('users', user);
-  }
-
-  async setPassword(email: string, newPassword: string, temporary: boolean): Promise<UserAccount | null> {
-    const user = this.getUserByEmail(email);
-    if (!user) return null;
-    user.passwordHash = await hashPassword(newPassword);
-    user.isTemporaryPassword = temporary;
-    this.save('users', user);
-    return user;
   }
 
   // ---------- Students ----------

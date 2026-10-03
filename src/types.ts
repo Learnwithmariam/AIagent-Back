@@ -8,10 +8,11 @@ export interface UserAccount {
   email: string;
   name: string;
   role: Role;
-  /** Only the lecturer has a password (emergency sign-in). Students sign in with emailed codes. */
+  /** @deprecated passwords were removed; may still exist on old records and is never sent out */
   passwordHash?: string;
-  /** @deprecated legacy plaintext field, migrated to passwordHash on load */
+  /** @deprecated legacy plaintext field from the first prototype */
   temporaryPassword?: string;
+  /** @deprecated always false now that sign-in is passwordless */
   isTemporaryPassword: boolean;
   createdAt?: string;
   lastLoginAt?: string;

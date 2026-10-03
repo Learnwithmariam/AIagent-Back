@@ -51,9 +51,8 @@ EXAM_SUBMIT_GRACE_SECONDS = "60"
 
 # Secrets — set once with `npx wrangler secret put <NAME>` (never commit them):
 #   JWT_SECRET          long random string
-#   ADMIN_PASSWORD      lecturer's first password (used only when no admin exists yet)
 #   GEMINI_API_KEY      https://aistudio.google.com/apikey (primary AI)
 #   OPENROUTER_API_KEY  https://openrouter.ai/keys (fallback AI)
-#   RESEND_API_KEY      https://resend.com/api-keys (optional; without it passwords are shown once in the UI)
+#   RESEND_API_KEY      https://resend.com/api-keys (sign-in codes, invites and the digest)
 
 # Local development (`npm run dev`) reads overrides and secrets from .dev.vars
