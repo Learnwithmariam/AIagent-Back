@@ -54,6 +54,7 @@ EXAM_SUBMIT_GRACE_SECONDS = "60"
 #   JWT_SECRET          long random string
 #   GEMINI_API_KEY      https://aistudio.google.com/apikey (primary AI)
 #   OPENROUTER_API_KEY  https://openrouter.ai/keys (fallback AI)
-#   RESEND_API_KEY      https://resend.com/api-keys (sign-in codes, invites and the digest)
+#   BREVO_API_KEY       https://app.brevo.com/settings/keys/api (primary email: codes, invites, digest)
+#   RESEND_API_KEY      https://resend.com/api-keys (fallback email when Brevo fails)
 
 # Local development (`npm run dev`) reads overrides and secrets from .dev.vars

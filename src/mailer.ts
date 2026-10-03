@@ -1,8 +1,10 @@
 import { APP_NAME, type Config } from './config';
 
 /**
- * Email via Resend's HTTP API (https://resend.com). Workers can't open SMTP connections the way
- * nodemailer did, and an HTTP API is also faster for the daily digest (batch sends).
+ * Email over HTTP APIs (Workers can't open SMTP connections). Two providers, in order:
+ *   1. Brevo  (300 free emails/day) — tried first for every message
+ *   2. Resend (100 free emails/day) — automatic fallback when Brevo fails for any reason
+ * Both send from the same address (MAIL_FROM), whose domain is verified with both providers.
  */
 
 export interface EmailAuditLog {
@@ -11,6 +13,7 @@ export interface EmailAuditLog {
   recipientEmail: string;
   subject: string;
   status: 'sent' | 'failed' | 'not_configured';
+  provider?: 'brevo' | 'resend';
   error?: string;
 }
 
@@ -29,19 +32,36 @@ export const escapeHtml = (s: unknown) =>
     .replace(/"/g, '&quot;');
 
 const RESEND_URL = 'https://api.resend.com';
+const BREVO_URL = 'https://api.brevo.com/v3/smtp/email';
+/** After Brevo reports a rate limit or exhausted quota, skip it for this long and go straight to Resend. */
+const BREVO_PAUSE_MS = 60 * 60_000;
+
+class ProviderError extends Error {
+  constructor(
+    message: string,
+    public status: number
+  ) {
+    super(message);
+  }
+}
+
+/** "Name <addr@x>" → { name, email } */
+function parseAddress(from: string): { name?: string; email: string } {
+  const m = /^\s*(.*?)\s*<([^>]+)>\s*$/.exec(from);
+  return m ? { name: m[1].replace(/^"|"$/g, '') || undefined, email: m[2].trim() } : { email: from.trim() };
+}
 
 export class Mailer {
   // Kept in memory: an operational log, not a record. Resets when the Durable Object restarts.
   private auditLogs: EmailAuditLog[] = [];
-
   private resolvedFrom: string | null = null;
+  private brevoPausedUntil = 0;
 
   constructor(private config: Config) {}
 
   /**
    * Sender address. MAIL_FROM wins when set. Otherwise the sender is noreply@ on the first domain
-   * verified in the Resend account, so email works as soon as a domain is verified without a
-   * config change. Falls back to Resend's test sender, which only reaches the account owner.
+   * verified in the Resend account, falling back to Resend's test sender.
    */
   private async fromAddress(): Promise<string> {
     if (this.config.mail.from) return this.config.mail.from;
@@ -56,14 +76,21 @@ export class Mailer {
       console.log(`Email sender: ${this.resolvedFrom}`);
       return this.resolvedFrom;
     } catch (err: any) {
-      // not cached, so a domain verified later is picked up on the next send
       console.warn(`Could not look up a verified Resend domain (${err?.message}); set MAIL_FROM. Using the test sender.`);
       return `${APP_NAME} <onboarding@resend.dev>`;
     }
   }
 
-  get isConfigured() {
+  private get hasBrevo() {
+    return Boolean(this.config.mail.brevoApiKey);
+  }
+
+  private get hasResend() {
     return Boolean(this.config.mail.resendApiKey);
+  }
+
+  get isConfigured() {
+    return this.hasBrevo || this.hasResend;
   }
 
   private log(entry: Omit<EmailAuditLog, 'id' | 'sentAt'>) {
@@ -71,44 +98,104 @@ export class Mailer {
     if (this.auditLogs.length > 500) this.auditLogs.length = 500;
   }
 
-  private async post(path: string, body: unknown) {
+  // ---------- Brevo (primary) ----------
+
+  private async brevoSend(from: string, e: OutgoingEmail) {
+    const res = await fetch(BREVO_URL, {
+      method: 'POST',
+      headers: { 'api-key': this.config.mail.brevoApiKey, 'Content-Type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({
+        sender: parseAddress(from),
+        to: [{ email: e.to }],
+        subject: e.subject,
+        htmlContent: e.html,
+        textContent: e.text,
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) throw new ProviderError(`Brevo ${res.status}: ${(await res.text()).slice(0, 200)}`, res.status);
+  }
+
+  /** Tries Brevo for each email; returns the ones Brevo did not deliver. */
+  private async sendViaBrevo(from: string, emails: OutgoingEmail[], delivered: string[]): Promise<OutgoingEmail[]> {
+    const leftover: OutgoingEmail[] = [];
+    for (let i = 0; i < emails.length; i += 10) {
+      const chunk = emails.slice(i, i + 10);
+      if (Date.now() < this.brevoPausedUntil) {
+        leftover.push(...emails.slice(i));
+        break;
+      }
+      await Promise.all(
+        chunk.map(async (e) => {
+          try {
+            await this.brevoSend(from, e);
+            delivered.push(e.to);
+            this.log({ recipientEmail: e.to, subject: e.subject, status: 'sent', provider: 'brevo' });
+          } catch (err: any) {
+            const status = err instanceof ProviderError ? err.status : 0;
+            // 429 = rate limited, 402 = out of credits (daily limit): stop using Brevo for a while
+            if (status === 429 || status === 402) {
+              this.brevoPausedUntil = Date.now() + BREVO_PAUSE_MS;
+              console.warn(`Brevo limit reached (${status}); using Resend for the next hour.`);
+            } else {
+              console.warn(`Brevo failed for one email, falling back to Resend: ${err?.message}`);
+            }
+            leftover.push(e);
+          }
+        })
+      );
+    }
+    return leftover;
+  }
+
+  // ---------- Resend (fallback) ----------
+
+  private async resendPost(path: string, body: unknown) {
     const res = await fetch(`${RESEND_URL}${path}`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.config.mail.resendApiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
     });
-    if (!res.ok) throw new Error(`Resend ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    if (!res.ok) throw new ProviderError(`Resend ${res.status}: ${(await res.text()).slice(0, 200)}`, res.status);
+  }
+
+  /** Sends in batches of 100 (Resend's batch limit). */
+  private async sendViaResend(from: string, emails: OutgoingEmail[], delivered: string[]) {
+    for (let i = 0; i < emails.length; i += 100) {
+      const batch = emails.slice(i, i + 100);
+      try {
+        await this.resendPost(
+          batch.length === 1 ? '/emails' : '/emails/batch',
+          batch.length === 1 ? { from, ...batch[0], to: [batch[0].to] } : batch.map((e) => ({ from, ...e, to: [e.to] }))
+        );
+        for (const e of batch) {
+          delivered.push(e.to);
+          this.log({ recipientEmail: e.to, subject: e.subject, status: 'sent', provider: 'resend' });
+        }
+      } catch (err: any) {
+        console.error('Email error (Resend fallback):', err?.message);
+        for (const e of batch) this.log({ recipientEmail: e.to, subject: e.subject, status: 'failed', provider: 'resend', error: err?.message });
+      }
+    }
   }
 
   async send(to: string, subject: string, html: string, text: string): Promise<boolean> {
     return (await this.sendMany([{ to, subject, html, text }])).length === 1;
   }
 
-  /** Sends in batches of 100 (Resend's batch limit). Returns the addresses that were accepted. */
+  /** Brevo first, then Resend for anything Brevo didn't deliver. Returns the delivered addresses. */
   async sendMany(emails: OutgoingEmail[]): Promise<string[]> {
     if (!this.isConfigured) {
       for (const e of emails) this.log({ recipientEmail: e.to, subject: e.subject, status: 'not_configured' });
       return [];
     }
-    const delivered: string[] = [];
     const from = await this.fromAddress();
-    for (let i = 0; i < emails.length; i += 100) {
-      const batch = emails.slice(i, i + 100);
-      try {
-        await this.post(
-          batch.length === 1 ? '/emails' : '/emails/batch',
-          batch.length === 1
-            ? { from, ...batch[0], to: [batch[0].to] }
-            : batch.map((e) => ({ from, ...e, to: [e.to] }))
-        );
-        for (const e of batch) {
-          delivered.push(e.to);
-          this.log({ recipientEmail: e.to, subject: e.subject, status: 'sent' });
-        }
-      } catch (err: any) {
-        console.error('Email error:', err?.message);
-        for (const e of batch) this.log({ recipientEmail: e.to, subject: e.subject, status: 'failed', error: err?.message });
-      }
+    const delivered: string[] = [];
+    const remaining = this.hasBrevo ? await this.sendViaBrevo(from, emails, delivered) : emails;
+    if (remaining.length) {
+      if (this.hasResend) await this.sendViaResend(from, remaining, delivered);
+      else for (const e of remaining) this.log({ recipientEmail: e.to, subject: e.subject, status: 'failed', provider: 'brevo', error: 'Brevo failed and Resend is not configured' });
     }
     return delivered;
   }

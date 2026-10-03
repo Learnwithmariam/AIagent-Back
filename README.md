@@ -39,7 +39,8 @@ Set the secrets once. They are stored encrypted in Cloudflare, never in git:
 npx wrangler secret put JWT_SECRET          # node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
 npx wrangler secret put GEMINI_API_KEY      # https://aistudio.google.com/apikey (primary AI)
 npx wrangler secret put OPENROUTER_API_KEY  # https://openrouter.ai/keys (fallback AI)
-npx wrangler secret put RESEND_API_KEY      # https://resend.com/api-keys (sign-in codes and invites)
+npx wrangler secret put BREVO_API_KEY       # https://app.brevo.com/settings/keys/api (primary email, 300/day free)
+npx wrangler secret put RESEND_API_KEY      # https://resend.com/api-keys (fallback email, 100/day free)
 ```
 
 Then edit `[vars]` in `wrangler.toml`: `ADMIN_EMAIL`, `FRONTEND_URL` (your Pages URL), `PUBLIC_APP_URL` and `MAIL_FROM`. Deploy:
@@ -90,7 +91,7 @@ npm run dev                      # http://localhost:8787
 | `DIGEST_EMAIL` | var | `"false"` keeps the daily 08:00 digest in-app only. Generating a digest from the dashboard never sends email |
 | `OPENROUTER_DIGEST_MODEL` | var | Optional. The digest only ever uses `:free` models, whatever is configured |
 | `DIGEST_FEEDS` | var | Comma-separated RSS/Atom feeds for the digest. Empty = TechCrunch Startups, Crunchbase News, Sifted, EU-Startups, VentureBeat |
-| `RESEND_API_KEY`, `MAIL_FROM` | secret / var | Email for sign-in codes, invites and the digest. `MAIL_FROM` must be on a domain verified in Resend |
+| `BREVO_API_KEY`, `RESEND_API_KEY`, `MAIL_FROM` | secret / secret / var | Email for sign-in codes, invites and the digest. Every email tries Brevo first and falls back to Resend if Brevo fails. After a Brevo 429 (rate limit) or 402 (out of credits), Brevo is skipped for an hour. `MAIL_FROM` (`noreply@btustudents.online`) must be verified with both providers |
 | `FRONTEND_URL` | var | Allowed CORS origins, comma-separated |
 | `EXAM_MAX_PAUSES` | var | Pause credits per attempt; `0` disables pausing |
 

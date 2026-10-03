@@ -12,6 +12,7 @@ export interface Env {
   GEMINI_API_KEY?: string;
   OPENROUTER_API_KEY?: string;
   RESEND_API_KEY?: string;
+  BREVO_API_KEY?: string;
 
   // vars
   ENVIRONMENT?: string;
@@ -99,6 +100,8 @@ export function buildConfig(env: Env) {
     },
 
     mail: {
+      /** Primary provider (300 free emails/day); Resend is the fallback */
+      brevoApiKey: env.BREVO_API_KEY || '',
       resendApiKey: env.RESEND_API_KEY || '',
       /** Empty = send from noreply@<the Resend account's verified domain>, looked up at runtime */
       from: (env.MAIL_FROM || '').trim(),

@@ -6,4 +6,5 @@ JWT_SECRET=dev-only-change-me
 ADMIN_EMAIL=giorgi.khatiashvili@btu.edu.ge
 GEMINI_API_KEY=
 OPENROUTER_API_KEY=sk-or-v1-...
+BREVO_API_KEY=
 RESEND_API_KEY=
